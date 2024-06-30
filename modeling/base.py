@@ -142,17 +142,18 @@ class Transformer(nn.Module):
         return x
 
 class VQVAE(nn.Module):
-    def __init__(self, features:int=768, codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, bias=True):
+    def __init__(self, features:int=768, codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=True):
         super().__init__()
         self.size = size
         self.patch = patch
 
-        ntoken = size//patch
-        self.epe = WPE(features, ntoken ** 2)
-        self.dpe = WPE(features, ntoken ** 2)
+        # See https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html for formula
+        self.ntoken = (size + 2 * padding - patch) // strides + 1
+        self.epe = WPE(features, self.ntoken ** 2)
+        self.dpe = WPE(features, self.ntoken ** 2)
 
         # patchify
-        self.input = nn.Conv2d(3, features, kernel_size=patch, stride=patch, bias=bias)
+        self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
         transformers = [Transformer(features, heads=heads, bias=bias) for _ in range(depth)]
         self.encoder = nn.Sequential(*[*transformers, nn.LayerNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
@@ -162,28 +163,16 @@ class VQVAE(nn.Module):
         transformers = [Transformer(features, heads=heads, bias=bias) for _ in range(depth)]
         self.decoder = nn.Sequential(*[*transformers, nn.LayerNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
         # pixelshuffle
-        self.output = nn.Conv2d(features, 3 * patch * patch, kernel_size=1, bias=bias)
-
-    def decode(self, idxes):
-        ratio = self.size // self.patch
-        codes = self.quantiser.codebook(idxes)
-        codes = self.quantiser.output(codes)
-
-        x = self.decoder(codes + self.dpe)
-        x = rearrange(x, 'b c (h w) -> b c h w', h=ratio, w=ratio)
-        x = rearrange(self.output(x), 'b (c hr wr) h w  -> b c (h hr) (w wr)', hr=self.patch, wr=self.patch)
-
-        return x
+        self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
 
     def forward(self, x):
-        ratio = self.size // self.patch
         x = rearrange(self.input(x), 'b c h w -> b (h w) c')
 
         x = self.encoder(self.epe(x))
         codes, loss, idxes = self.quantiser(x)
         x = self.decoder(self.dpe(x))
 
-        x = rearrange(x, 'b (h w) c -> b c h w', h=ratio, w=ratio)
-        x = rearrange(self.output(x), 'b (c hr wr) h w  -> b c (h hr) (w wr)', hr=self.patch, wr=self.patch)
+        x = rearrange(x, 'b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken)
+        x = self.output(x)
 
         return x, loss, idxes

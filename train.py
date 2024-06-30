@@ -41,7 +41,9 @@ def GLoss(G, P, reals):
 @click.option("--size", default=128, type=int)
 @click.option("--lr", default=1e-4, type=float)
 @click.option("--batch_size", default=64, type=int)
-@click.option("--patch", default=16, type=str)
+@click.option("--patch", default=16, type=int)
+@click.option("--strides", default=16, type=int)
+@click.option("--padding", default=0, type=int)
 @click.option("--gradient_accumulation_steps", default=4, type=int)
 @click.option("--log_every_n_steps", default=1024, type=int)
 def main(**config):
@@ -49,7 +51,7 @@ def main(**config):
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
     accelerator.init_trackers("vit", config)
 
-    G = VQVAE(size=config["size"])
+    G = VQVAE(patch=config["patch"], size=config["size"], strides=config["strides"], padding=config["padding"])
     P = lpips.LPIPS(net='vgg')
     P = P.eval()
 
