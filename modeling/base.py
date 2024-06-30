@@ -91,6 +91,80 @@ class WPE(nn.Module):
     def forward(self, x):
         return x + self.embeddings
 
+class RotaryEmbeddings:
+    def __init__(self, dim:int, heads:int, height:int, width:int, base:int = 10000, device='cuda'):
+        self.dim = dim // heads
+        self.base = base
+
+        t = torch.arange(height * width, device=device, dtype=torch.float)
+        tx, ty = t % width, t // width
+        tx, ty = tx.to(t.dtype), ty.to(t.dtype)
+
+        rtheta = base ** (torch.arange(0, dim, 4, dtype=torch.float)[:dim//4] / dim)  
+
+        hidx = torch.outer(torch.arange(height, dtype=rtheta.dtype, device=rtheta.device), 1/rtheta)
+        widx = torch.outer(torch.arange(width, dtype=rtheta.dtype, device=rtheta.device), 1/rtheta)  
+
+        hcache = torch.stack((hidx.cos(), hidx.sin()), dim=-1)
+        wcache = torch.stack((widx.cos(), widx.sin()), dim=-1)
+
+        
+
+    def rotate(xq:Tensor, xk:Tensor, freqeuncies:Tensor):
+        xq
+
+
+# Taken and modified from torchtune implementation
+class Rotary2DEmbeddings(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        height: int,
+        width: int,
+        base: int = 10000,
+    ) -> None:
+        super().__init__()
+        self.dim = dim // heads
+        self.base = base
+        self.height = height
+        self.width = width
+        self._initialise()
+
+    def _initialise(self):
+        rtheta = self.base ** (torch.arange(0, self.dim, 4, dtype=torch.float) / self.dim)        
+        hidx = torch.outer(torch.arange(self.height, dtype=rtheta.dtype, device=rtheta.device), 1/rtheta)
+        widx = torch.outer(torch.arange(self.width, dtype=rtheta.dtype, device=rtheta.device), 1/rtheta)
+        
+        hcache = torch.stack((hidx.cos(), hidx.sin()), dim=-1)
+        wcache = torch.stack((widx.cos(), widx.sin()), dim=-1)
+
+        self.register_buffer('hcache', hcache, persistent=False)
+        self.register_buffer('wcache', wcache, persistent=False)
+        
+
+    def forward(self, x: Tensor) -> Tensor:
+        # input tensor has shape [b, t, hd, d]
+        b, t, _, _ = x.shape
+        
+        xshaped = rearrange(x, 'b t hd (d 4) -> b t hd d 4')
+        yx = torch.meshgrid(torch.arange(self.height, device=x.device), torch.arange(self.width, device=x.device))
+
+        hcache = rearrange(hcache, 't (d 4) -> 1 t 1 d 4')
+
+        # tensor has shape [b, t, hd, d // 4, 4]
+        x_out = torch.stack(
+            [
+                xshaped[..., 0] * hcache[..., 0] - xshaped[..., 1] * hcache[..., 1],
+                xshaped[..., 1] * hcache[..., 0] + xshaped[..., 0] * hcache[..., 1],
+            ],
+            -1,
+        )
+
+        # tensor has shape [b, s, n_h, n_d]
+        x_out = x_out.flatten(3)
+        return x_out.type_as(x)
+    
 # RMSNorm implementation taken from LLaMA repository
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -123,7 +197,7 @@ class Attention(nn.Module):
         self.attention = nn.MultiheadAttention(features, heads, bias=bias)
         self.out = nn.Linear(features, features)
 
-    def forward(self, x):
+    def forward(self, x, frequencies):
         x, attn = self.attention(x, x, x) # q k v
         x = self.out(x)
         return x
