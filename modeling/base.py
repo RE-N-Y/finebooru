@@ -5,8 +5,10 @@ import torch.nn.functional as F
 
 import math
 import numpy as onp
+from functools import partial
 from einops import rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange
+from mamba_ssm import Mamba2
 
 class Downsample(nn.Module):
     def __init__(self):
@@ -116,6 +118,45 @@ class SwiGLU(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
+class SSD(nn.Module):
+    def __init__(self, features:int, heads:int, bias=True):
+        super().__init__()
+        self.mamba = Mamba2(features)
+        self.prenorm = RMSNorm(features)
+        self.postnorm = RMSNorm(features)
+        self.mlp = SwiGLU(features)
+
+    def forward(self, x):
+        x = self.mamba(self.prenorm(x)) + x
+        x = self.mlp(self.postnorm(x)) + x
+
+        return x
+
+# simple bidirectional mamba similar to Bidirectional LSTM
+class BSSD(nn.Module):
+    def __init__(self, features:int, heads:int, bias=True):
+        super().__init__()
+
+        self.fwd = Mamba2(features)
+        self.bwd = Mamba2(features)
+
+        self.prenorm = RMSNorm(features)
+        self.fwdnorm = RMSNorm(features)
+        self.bwdnorm = RMSNorm(features)
+
+        self.fwdmlp = SwiGLU(features)
+        self.bwdmlp = SwiGLU(features)
+
+    def forward(self, x):
+        f,b = x, x[:,::-1,:]
+
+        f = self.fwd(self.prenorm(f)) + f
+        f = self.fwdmlp(self.fwdnorm(f)) + f
+        b = self.bwd(self.prenorm(b)) + b
+        b = self.bwdmlp(self.bwdnorm(b)) + b
+
+        return f + b
+
 class Attention(nn.Module):
     def __init__(self, features:int, heads:int, bias=True):
         super().__init__()
@@ -142,7 +183,7 @@ class Transformer(nn.Module):
         return x
 
 class VQVAE(nn.Module):
-    def __init__(self, features:int=768, codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=True):
+    def __init__(self, features:int=768, backbone="attention", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=True):
         super().__init__()
         self.size = size
         self.patch = patch
@@ -152,15 +193,24 @@ class VQVAE(nn.Module):
         self.epe = WPE(features, self.ntoken ** 2)
         self.dpe = WPE(features, self.ntoken ** 2)
 
+        if backbone == "attention":
+            Block = Transformer
+        elif backbone == "ssd":
+            Block = SSD
+        elif backbone == "bssd":
+            Block = BSSD
+        else:
+            raise ValueError(f"Unknown backbone {backbone}")
+
         # patchify
         self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
-        transformers = [Transformer(features, heads=heads, bias=bias) for _ in range(depth)]
+        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
         self.encoder = nn.Sequential(*[*transformers, nn.LayerNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
         # quantiser
         self.quantiser = VectorQuantiser(features, codes, pages)
         # decoder
-        transformers = [Transformer(features, heads=heads, bias=bias) for _ in range(depth)]
+        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
         self.decoder = nn.Sequential(*[*transformers, nn.LayerNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
         # pixelshuffle
         self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
