@@ -38,6 +38,8 @@ def GLoss(G, P, reals):
     }
 
 @click.command()
+@click.option("--backbone", default="attention", type=str)
+@click.option("--compile", default=False, type=bool)
 @click.option("--size", default=128, type=int)
 @click.option("--lr", default=1e-4, type=float)
 @click.option("--batch_size", default=64, type=int)
@@ -51,7 +53,7 @@ def main(**config):
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
     accelerator.init_trackers("vit", config)
 
-    G = VQVAE(patch=config["patch"], size=config["size"], strides=config["strides"], padding=config["padding"])
+    G = VQVAE(backbone=config["backbone"], patch=config["patch"], size=config["size"], strides=config["strides"], padding=config["padding"])
     P = lpips.LPIPS(net='vgg')
     P = P.eval()
 
@@ -75,7 +77,8 @@ def main(**config):
         shuffle=True
     )
 
-    G, P = torch.compile(G), torch.compile(P)
+    if config["compile"]:
+        G, P = torch.compile(G), torch.compile(P)
     Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(0.9, 0.99), weight_decay=1e-4)
 
     G, P, Gtx, dataloader = accelerator.prepare(G, P, Gtx, dataloader)

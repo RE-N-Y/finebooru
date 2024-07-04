@@ -148,12 +148,16 @@ class BSSD(nn.Module):
         self.bwdmlp = SwiGLU(features)
 
     def forward(self, x):
-        f,b = x, x[:,::-1,:]
+        # b t d
+        f = x
+        b = torch.flip(x, dims=[1])
 
         f = self.fwd(self.prenorm(f)) + f
         f = self.fwdmlp(self.fwdnorm(f)) + f
         b = self.bwd(self.prenorm(b)) + b
         b = self.bwdmlp(self.bwdnorm(b)) + b
+
+        b = torch.flip(b, dims=[1])
 
         return f + b
 
