@@ -9,6 +9,7 @@ import lpips
 import wandb
 import deeplake
 
+from dreamsim import dreamsim
 from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
 from modeling.base import VQVAE
@@ -39,6 +40,7 @@ def GLoss(G, P, reals):
 
 @click.command()
 @click.option("--backbone", default="attention", type=str)
+@click.option("--perceptual", default="lpips", type=str)
 @click.option("--compile", default=False, type=bool)
 @click.option("--size", default=128, type=int)
 @click.option("--lr", default=1e-4, type=float)
@@ -54,8 +56,14 @@ def main(**config):
     accelerator.init_trackers("vit", config)
 
     G = VQVAE(backbone=config["backbone"], patch=config["patch"], size=config["size"], strides=config["strides"], padding=config["padding"])
-    P = lpips.LPIPS(net='vgg')
-    P = P.eval()
+    if config["perceptual"] == "lpips":
+        P = lpips.LPIPS(net='vgg')
+        P = P.eval()
+    elif config["perceptual"] == "dreamsim":
+        model, _ =  dreamsim(pretrained=True)
+        model = model.eval()
+        tform = T.Resize((224, 224), interpolation=T.InterpolationMode.BICUBIC)
+        P = lambda x, y: model(tform(x), tform(y))
 
     ds = deeplake.load("hub://reny/animefaces")
 
