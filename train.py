@@ -11,7 +11,7 @@ import deeplake
 
 from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
-from modeling.base import VQVAE
+from modeling.base import VQVAE, MVQVAE
 
 import math
 import click
@@ -38,6 +38,7 @@ def GLoss(G, P, reals):
     }
 
 @click.command()
+@click.option("--features", default=768, type=int)
 @click.option("--backbone", default="attention", type=str)
 @click.option("--compile", default=False, type=bool)
 @click.option("--size", default=128, type=int)
@@ -53,7 +54,13 @@ def main(**config):
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
     accelerator.init_trackers("vit", config)
 
-    G = VQVAE(backbone=config["backbone"], patch=config["patch"], size=config["size"], strides=config["strides"], padding=config["padding"])
+    if config["backbone"] == "attention":
+        G = VQVAE(features=config["features"], patch=config["patch"], size=config["size"], strides=config["strides"], padding=config["padding"])
+    elif config["backbone"] == "bssd":
+        G = MVQVAE(features=config["features"], patch=config["patch"], size=config["size"], strides=config["strides"], padding=config["padding"])
+    else:
+        raise ValueError(f"Invalid backbone {config['backbone']}")
+
     P = lpips.LPIPS(net='vgg')
     P = P.eval()
 

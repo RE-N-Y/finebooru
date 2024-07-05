@@ -7,8 +7,8 @@ import math
 import numpy as onp
 from functools import partial
 from einops import rearrange, repeat, reduce, pack, unpack
-from einops.layers.torch import Rearrange
 from mamba_ssm import Mamba2
+from mamba_ssm.ops.triton.layer_norm import RMSNorm as TritonRMSNorm, layer_norm_fn
 
 class Downsample(nn.Module):
     def __init__(self):
@@ -137,29 +137,32 @@ class BSSD(nn.Module):
     def __init__(self, features:int, heads:int, bias=True):
         super().__init__()
 
+        self.prenorm = TritonRMSNorm(features)
+        self.fwdnorm = TritonRMSNorm(features)
+        self.bwdnorm = TritonRMSNorm(features)
+
         self.fwd = Mamba2(features)
         self.bwd = Mamba2(features)
-
-        self.prenorm = RMSNorm(features)
-        self.fwdnorm = RMSNorm(features)
-        self.bwdnorm = RMSNorm(features)
-
         self.fwdmlp = SwiGLU(features)
         self.bwdmlp = SwiGLU(features)
 
-    def forward(self, x):
-        # b t d
-        f = x
-        b = torch.flip(x, dims=[1])
+    def forward(self, x, r=None):
+        # apply prenorm
+        x, r = layer_norm_fn(x, self.prenorm.weight, self.prenorm.bias, residual=r, prenorm=True, is_rms_norm=True)
 
-        f = self.fwd(self.prenorm(f)) + f
-        f = self.fwdmlp(self.fwdnorm(f)) + f
-        b = self.bwd(self.prenorm(b)) + b
-        b = self.bwdmlp(self.bwdnorm(b)) + b
+        f, rf = x, r
+        b, rb = torch.flip(x, dims=[1]), torch.flip(r, dims=[1])
 
-        b = torch.flip(b, dims=[1])
+        f, b = self.fwd(f), self.bwd(b)
+        f, rf = layer_norm_fn(f, self.fwdnorm.weight, self.fwdnorm.bias, residual=rf, prenorm=True, is_rms_norm=True)
+        b, rb = layer_norm_fn(b, self.bwdnorm.weight, self.bwdnorm.bias, residual=rb, prenorm=True, is_rms_norm=True)
 
-        return f + b
+        f, b = self.fwdmlp(f), self.bwdmlp(b)
+
+        ## flip it back
+        b, rb = torch.flip(b, dims=[1]), torch.flip(rb, dims=[1])
+
+        return (f + b) / 2, (rf + rb) / 2
 
 class Attention(nn.Module):
     def __init__(self, features:int, heads:int, bias=True):
@@ -187,7 +190,7 @@ class Transformer(nn.Module):
         return x
 
 class VQVAE(nn.Module):
-    def __init__(self, features:int=768, backbone="attention", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=True):
+    def __init__(self, features:int=768, codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=True):
         super().__init__()
         self.size = size
         self.patch = patch
@@ -197,25 +200,16 @@ class VQVAE(nn.Module):
         self.epe = WPE(features, self.ntoken ** 2)
         self.dpe = WPE(features, self.ntoken ** 2)
 
-        if backbone == "attention":
-            Block = Transformer
-        elif backbone == "ssd":
-            Block = SSD
-        elif backbone == "bssd":
-            Block = BSSD
-        else:
-            raise ValueError(f"Unknown backbone {backbone}")
-
         # patchify
         self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
-        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.encoder = nn.Sequential(*[*transformers, nn.LayerNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        transformers = [Transformer(features, heads=heads, bias=bias) for _ in range(depth)]
+        self.encoder = nn.Sequential(*[*transformers, TritonRMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
         # quantiser
         self.quantiser = VectorQuantiser(features, codes, pages)
         # decoder
-        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.decoder = nn.Sequential(*[*transformers, nn.LayerNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        transformers = [Transformer(features, heads=heads, bias=bias) for _ in range(depth)]
+        self.decoder = nn.Sequential(*[*transformers, TritonRMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
         # pixelshuffle
         self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
 
@@ -226,6 +220,52 @@ class VQVAE(nn.Module):
         codes, loss, idxes = self.quantiser(x)
         x = self.decoder(self.dpe(x))
 
+        x = rearrange(x, 'b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken)
+        x = self.output(x)
+
+        return x, loss, idxes
+    
+
+class MVQVAE(nn.Module):
+    def __init__(self, features:int=768, codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=True):
+        super().__init__()
+
+        self.size = size
+        self.patch = patch
+
+        # See https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html for formula
+        self.ntoken = (size + 2 * padding - patch) // strides + 1
+        self.epe = WPE(features, self.ntoken ** 2)
+        self.dpe = WPE(features, self.ntoken ** 2)
+
+        # patchify
+        self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
+        # encoder
+        self.encoder = nn.ModuleList([BSSD(features, heads=heads, bias=bias) for _ in range(depth)])
+        self.en = nn.Sequential(TritonRMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features))
+        # quantiser
+        self.quantiser = VectorQuantiser(features, codes, pages)
+        # decoder
+        self.decoder = nn.ModuleList([BSSD(features, heads=heads, bias=bias) for _ in range(depth)])
+        self.de = nn.Sequential(TritonRMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features))
+        # pixelshuffle
+        self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
+
+    def forward(self, x):
+        x = rearrange(self.input(x), 'b c h w -> b (h w) c')
+
+        x, r = self.epe(x), None
+        for layer in self.encoder:
+            x, r = layer(x, r)
+        
+        x = self.en(x)
+        codes, loss, idxes = self.quantiser(x)
+        
+        x, r = self.dpe(x), None
+        for layer in self.decoder:
+            x, r = layer(x, r)
+
+        x = self.de(x)
         x = rearrange(x, 'b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken)
         x = self.output(x)
 
