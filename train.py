@@ -2,6 +2,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 from einops import rearrange, repeat, reduce
 
 
@@ -12,7 +13,7 @@ import deeplake
 from dreamsim import dreamsim
 from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
-from modeling.base import VQVAE
+from modeling.base import VQVAE, CVQVAE
 
 import math
 import click
@@ -26,10 +27,9 @@ def GLoss(G, P, reals):
     perceptual = P(reals, fakes)
 
     loss =  1 * compress + \
-            1 * perceptual.square().mean() + \
-           .1 * l1.mean() + \
-           .1 * l2.mean()
-
+           .1 * perceptual.mean() + \
+            1 * l2.mean()
+            
     return {
         "loss":loss,
         "compress":compress,
@@ -40,30 +40,46 @@ def GLoss(G, P, reals):
 
 @click.command()
 @click.option("--backbone", default="attention", type=str)
-@click.option("--perceptual", default="lpips", type=str)
 @click.option("--compile", default=False, type=bool)
-@click.option("--size", default=128, type=int)
-@click.option("--lr", default=1e-4, type=float)
+@click.option("--size", default=256, type=int)
+@click.option("--lr", default=3e-4, type=float)
+@click.option("--features", default=768, type=int)
+@click.option("--codes", default=8, type=int)
+@click.option("--pages", default=16384, type=int)
+@click.option("--heads", default=12, type=int)
 @click.option("--batch_size", default=64, type=int)
 @click.option("--patch", default=16, type=int)
 @click.option("--strides", default=16, type=int)
 @click.option("--padding", default=0, type=int)
-@click.option("--gradient_accumulation_steps", default=4, type=int)
+@click.option("--epochs", default=42, type=int)
+@click.option("--gradient_accumulation_steps", default=8, type=int)
 @click.option("--log_every_n_steps", default=1024, type=int)
+@click.option("--depth", default=12, type=int)
 def main(**config):
     torch.set_float32_matmul_precision('high')
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
     accelerator.init_trackers("vit", config)
 
-    G = VQVAE(backbone=config["backbone"], patch=config["patch"], size=config["size"], strides=config["strides"], padding=config["padding"])
-    if config["perceptual"] == "lpips":
-        P = lpips.LPIPS(net='vgg')
-        P = P.eval()
-    elif config["perceptual"] == "dreamsim":
-        model, _ =  dreamsim(pretrained=True)
-        model = model.eval()
-        tform = T.Resize((224, 224), interpolation=T.InterpolationMode.BICUBIC)
-        P = lambda x, y: model(tform(x), tform(y))
+    if config["backbone"] == "convolution":
+        G = CVQVAE(features=config["features"], codes=config["codes"], pages=config["pages"], size=config["size"])
+    elif config["backbone"] in ["attention", "ssd", "bssd", "vssd", "ssdv"]:
+        G = VQVAE(
+            backbone=config["backbone"], 
+            features=config["features"],
+            heads=config["heads"],
+            codes=config["codes"],
+            pages=config["pages"],
+            depth=config["depth"],
+            patch=config["patch"], 
+            size=config["size"],
+            strides=config["strides"], 
+            padding=config["padding"]
+        )
+    else:
+        raise ValueError(f"Invalid backbone {config['backbone']}")
+    
+    P = lpips.LPIPS(net='vgg')
+    P = P.eval()
 
     ds = deeplake.load("hub://reny/animefaces")
 
@@ -71,7 +87,7 @@ def main(**config):
         T.ToTensor(), T.Resize(config["size"], antialias=True),
         T.RandomResizedCrop(config["size"], scale=(0.8, 1), antialias=True),
         T.RandomHorizontalFlip(0.3), T.RandomAdjustSharpness(2,0.3), T.RandomAutocontrast(0.3),
-        T.ConvertImageDtype(torch.float)
+        T.ConvertImageDtype(torch.float), T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
     ])
 
     dataloader = ds.pytorch(
@@ -86,10 +102,16 @@ def main(**config):
     )
 
     if config["compile"]:
-        G, P = torch.compile(G), torch.compile(P)
-    Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(0.9, 0.99), weight_decay=1e-4)
+        ops = dict(options={"triton.cudagraphs": True}, fullgraph=True)
+        G, P = torch.compile(G, **ops), torch.compile(P, **ops)
 
-    G, P, Gtx, dataloader = accelerator.prepare(G, P, Gtx, dataloader)
+    Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(0.9, 0.95), weight_decay=0.05)
+    scheduler = get_cosine_schedule_with_warmup(Gtx, 1024, config["epochs"] * len(dataloader))
+
+    size = sum(p.numel() for p in G.parameters() if p.requires_grad) / 1e+6
+    accelerator.log({ "parameters" : size })
+
+    G, P, Gtx, scheduler, dataloader = accelerator.prepare(G, P, Gtx, scheduler, dataloader)
 
     for epoch in tqdm(range(42)):
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
@@ -100,14 +122,18 @@ def main(**config):
                 output = GLoss(G, P, reals)
                 losses["G"] = output["loss"]
                 accelerator.backward(losses["G"])
+
                 Gtx.step()
+                scheduler.step()
                 Gtx.zero_grad()
+                
 
             accelerator.log({ **output, **losses })
 
             if idx % config["log_every_n_steps"] == 0:
                 with torch.no_grad():
                     fakes, _, _ = G(reals)
+                    reals, fakes = (reals + 1) / 2, (fakes + 1) / 2
                     reals, fakes = reals.clamp(0,1), fakes.clamp(0,1)
                     accelerator.log({ "samples" : wandb.Image(fakes), "reals" : wandb.Image(reals) })
 
