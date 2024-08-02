@@ -62,7 +62,7 @@ class GumbelQuantiser(nn.Module):
         return codes, divergence.mean(), idxes
 
 class VectorQuantiser(nn.Module):
-    def __init__(self, features, codes, pages, beta:float=0.25):
+    def __init__(self, features, codes, pages, beta:float=0.25, **kwargs):
         super().__init__()
         self.codes = codes
         self.pages = pages
@@ -86,6 +86,78 @@ class VectorQuantiser(nn.Module):
         codes = self.output(codes)
 
         return codes, loss, idxes
+    
+class LFQuantiser(nn.Module):
+    def __init__(self, features:int, codes:int, pages:int, beta:float=0.25, temperature:float=0.1, **kwargs):
+        super().__init__()
+
+        self.codes = int(math.log2(pages))
+        self.input = nn.Linear(features, self.codes)
+        self.output = nn.Linear(self.codes, features)
+        self.beta = beta
+        
+        mask = torch.exp2(torch.arange(self.codes - 1, -1, -1))
+        self.temperature = temperature
+        self.register_buffer("mask", mask, persistent=False)
+        self.register_buffer("usage", torch.arange(pages))
+
+    def forward(self, z):
+        z = F.normalize(self.input(z), dim=-1)
+        ones = torch.ones(z.shape, device=z.device, dtype=z.dtype)
+        codes = torch.where(z > 0, ones, -ones) # b t d
+        idxes = reduce((codes > 0) * self.mask[None, None, :], 'b t d -> b t', 'sum')
+        codes = F.normalize(codes, dim=-1)
+
+        loss = self.beta * torch.mean((z - codes.detach()) ** 2)
+        codes = z + (codes - z).detach()
+        codes = self.output(codes)
+
+        return codes, loss, idxes
+    
+
+class FSQuantiser(nn.Module):
+    def __init__(self, features:int, codes:int, pages:int, levels:list[int] = [], beta:float=0.25, **kwargs):
+        super().__init__()
+
+        basis = onp.concatenate(([1], onp.cumprod(levels[:-1])))
+        self.register_buffer("basis", torch.tensor(basis, dtype=torch.int))
+        self.register_buffer("levels", torch.tensor(levels, dtype=torch.int))
+
+        codes = len(levels)
+        self.codes = codes
+        self.pages = onp.prod(levels)
+
+        self.input = nn.Linear(features, codes)
+        self.output = nn.Linear(codes, features)
+        self.eps = 1e-3
+
+    def bound(self, z):
+        half = (self.levels - 1) * (1 - self.eps) / 2
+        offset = torch.where(self.levels % 2 == 1, 0.0, 0.5)
+        shift = torch.tan(offset / half)
+        return torch.tanh(z + shift) * half - offset
+    
+    def quantize(self, z:Tensor) -> Tensor:
+        """Quanitzes z, returns quantized zhat, same shape as z."""
+        quantized = z + (torch.round(self.bound(z)) - z).detach()
+
+        # Renormalize to [-1, 1].
+        half = self.levels // 2
+        return quantized / half
+    
+    def indexes(self, codes:Tensor) -> Tensor:
+        half = self.levels // 2
+        codes = codes * half + half
+        idxes = torch.sum(codes * self.basis, dim=-1)
+        return idxes.to(torch.uint32)
+    
+    def forward(self, z):
+        z = self.input(z)
+        codes = self.quantize(z)
+        idxes = self.indexes(codes)
+        z = self.output(codes)
+        
+        return z, 0, idxes
 
 class WPE(nn.Module):
     def __init__(self, features:int, length:int):
@@ -471,7 +543,7 @@ class Transformer(nn.Module):
 class NeXtformer(nn.Module):
     def __init__(self, features:int, bias=False):
         super().__init__()
-        self.depthwise = nn.Conv2d(features, features, 7, padding=3, groups=features, bias=False)
+        self.depthwise = nn.Conv2d(features, features, 3, padding=1, groups=features, bias=False)
         self.prenorm = CRMSNorm(features)
         self.postnorm = CRMSNorm(features)
         self.mlp = CSwiGLU(features, bias=False)
@@ -484,7 +556,7 @@ class NeXtformer(nn.Module):
         return x  
 
 class CVQVAE(nn.Module):
-    def __init__(self, features:int=192, heads:int=12, codes:int=32, pages:int=8192, size:int=256, levels=3, bias=False):
+    def __init__(self, features:int=192, heads:int=12, codes:int=32, pages:int=8192, size:int=256, levels=3, bias=False, quantiser="vq", dims:int=[8,8,8,6,5], temperature=0.1):
         super().__init__()
         self.size = size
 
@@ -505,7 +577,16 @@ class CVQVAE(nn.Module):
         layers.extend([Rearrange('b c h w -> b (h w) c'), Transformer(features * maxmult, heads=heads, bias=bias)])
 
         self.encoder = nn.Sequential(*layers)
-        self.quantiser = VectorQuantiser(features * maxmult, codes, pages)
+        if quantiser == "vq":
+            self.quantiser = VectorQuantiser(features * maxmult, codes, pages)
+        elif quantiser == "lfq":
+            self.quantiser = LFQuantiser(features * maxmult, codes, pages, temperature=temperature)
+        elif quantiser == "gumbel":
+            self.quantiser = GumbelQuantiser(features * maxmult, codes, pages)
+        elif quantiser == "fsq":
+            self.quantiser = FSQuantiser(features * maxmult, codes, pages, levels=dims)
+        else:
+            raise ValueError(f"Unknown quantiser {quantiser}")
 
         layers = []
         layers.extend([Transformer(features * maxmult, heads=heads, bias=bias), Rearrange('b (h w) c -> b c h w', h=size, w=size)])
@@ -528,8 +609,9 @@ class CVQVAE(nn.Module):
 
 
 class VQVAE(nn.Module):
-    def __init__(self, features:int=768, backbone="attention", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=False):
+    def __init__(self, features:int=768, backbone="attention", quantiser="vq", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=False, temperature=0.1, dims:int=[8,8,8,6,5]):
         super().__init__()
+        self.features = features
         self.size = size
         self.patch = patch
         self.strides = strides
@@ -552,24 +634,39 @@ class VQVAE(nn.Module):
             raise ValueError(f"Unknown backbone {backbone}")
 
         # patchify
-        self.input = nn.Sequential(
-            nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias),
-            nn.Conv2d(features, features, 3, padding=1, bias=bias)
-        )
+        self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.encoder = nn.Sequential(*[*transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        self.encoder = nn.Sequential(*[*transformers, nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+
         # quantiser
-        self.quantiser = VectorQuantiser(features, codes, pages)
+        if quantiser == "vq":
+            self.quantiser = VectorQuantiser(features, codes, pages)
+        elif quantiser == "lfq":
+            self.quantiser = LFQuantiser(features, codes, pages, temperature=temperature)
+        elif quantiser == "gumbel":
+            self.quantiser = GumbelQuantiser(features, codes, pages)
+        elif quantiser == "fsq":
+            self.quantiser = FSQuantiser(features, codes, pages, levels=dims)
+        else:
+            raise ValueError(f"Unknown quantiser {quantiser}")
+        
         # decoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.decoder = nn.Sequential(*[*transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
-        
+        self.decoder = nn.Sequential(*[*transformers, nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
         # pixelshuffle
-        self.output = nn.Sequential(
-            nn.Conv2d(features, features, 3, padding=1, bias=bias),
-            nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
-        )
+        self.output = nn.Linear(features, 3 * patch * patch, bias=bias)
+
+    def initialise(self):
+        def base(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+        
+        self.apply(base)
+        nn.init.xavier_uniform_(self.input.weight.view(self.features, -1))
+
 
     def forward(self, x):
         x = rearrange(self.input(x), 'b c h w -> b (h w) c')
@@ -578,8 +675,8 @@ class VQVAE(nn.Module):
         codes, loss, idxes = self.quantiser(x)
         x = self.decoder(self.dpe(codes))
 
-        x = rearrange(x, 'b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken)
         x = self.output(x)
+        x = rearrange(x, 'b (h w) (c hr wr) -> b c (h hr) (w wr)', h=self.ntoken, w=self.ntoken, hr=self.patch, wr=self.patch, c=3)
 
         return x, loss, idxes
     

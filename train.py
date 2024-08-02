@@ -3,8 +3,6 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
-from einops import rearrange, repeat, reduce
-
 
 import lpips
 import wandb
@@ -39,6 +37,7 @@ def GLoss(G, P, reals):
     }
 
 @click.command()
+@click.option("--name", default="name", type=str)
 @click.option("--backbone", default="attention", type=str)
 @click.option("--compile", default=False, type=bool)
 @click.option("--size", default=256, type=int)
@@ -52,16 +51,28 @@ def GLoss(G, P, reals):
 @click.option("--strides", default=16, type=int)
 @click.option("--padding", default=0, type=int)
 @click.option("--epochs", default=42, type=int)
+@click.option("--steps", default=1e+6, type=int)
+@click.option("--quantiser", default="vq", type=str)
 @click.option("--gradient_accumulation_steps", default=8, type=int)
+@click.option("--temperature", default=1, type=float)
 @click.option("--log_every_n_steps", default=1024, type=int)
 @click.option("--depth", default=12, type=int)
+@click.option("--dims", default=[8,8,8,6,5], type=list[int])
 def main(**config):
     torch.set_float32_matmul_precision('high')
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
-    accelerator.init_trackers("vit", config)
+    accelerator.init_trackers("vit", config, init_kwargs={"wandb":{"name":config["name"]}})
 
     if config["backbone"] == "convolution":
-        G = CVQVAE(features=config["features"], codes=config["codes"], pages=config["pages"], size=config["size"])
+        G = CVQVAE(
+            features=config["features"], 
+            codes=config["codes"], 
+            pages=config["pages"], 
+            size=config["size"], 
+            quantiser=config["quantiser"], 
+            temperature=config["temperature"],
+            dims=config["dims"]
+        )
     elif config["backbone"] in ["attention", "ssd", "bssd", "vssd", "ssdv"]:
         G = VQVAE(
             backbone=config["backbone"], 
@@ -73,7 +84,10 @@ def main(**config):
             patch=config["patch"], 
             size=config["size"],
             strides=config["strides"], 
-            padding=config["padding"]
+            padding=config["padding"],
+            quantiser=config["quantiser"],
+            temperature=config["temperature"],
+            dims=config["dims"]
         )
     else:
         raise ValueError(f"Invalid backbone {config['backbone']}")
@@ -102,10 +116,9 @@ def main(**config):
     )
 
     if config["compile"]:
-        ops = dict(options={"triton.cudagraphs": True}, fullgraph=True)
-        G, P = torch.compile(G, **ops), torch.compile(P, **ops)
+        G, P = torch.compile(G), torch.compile(P)
 
-    Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(0.9, 0.95), weight_decay=0.05)
+    Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(0.9, 0.95))
     scheduler = get_cosine_schedule_with_warmup(Gtx, 1024, config["epochs"] * len(dataloader))
 
     size = sum(p.numel() for p in G.parameters() if p.requires_grad) / 1e+6
