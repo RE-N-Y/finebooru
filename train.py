@@ -17,6 +17,7 @@ import math
 import click
 from functools import partial
 from tqdm import tqdm
+from pathlib import Path
 
 def GLoss(G, P, reals):
     fakes, compress, idxes = G(reals)
@@ -149,6 +150,11 @@ def main(**config):
                     reals, fakes = (reals + 1) / 2, (fakes + 1) / 2
                     reals, fakes = reals.clamp(0,1), fakes.clamp(0,1)
                     accelerator.log({ "samples" : wandb.Image(fakes), "reals" : wandb.Image(reals) })
+        
+        outdir = Path(f"checkpoint/{config['name']}")
+        if not outdir.exists():
+            outdir.mkdir(parents=True)
+        accelerator.save_model(G, f"checkpoint/{config["name"]}")
 
 
 if __name__ == "__main__":

@@ -132,14 +132,14 @@ class FSQuantiser(nn.Module):
         self.eps = 1e-3
 
     def bound(self, z):
-        half = (self.levels - 1) * (1 - self.eps) / 2
+        half = (self.levels - 1) * (1 + self.eps) / 2
         offset = torch.where(self.levels % 2 == 1, 0.0, 0.5)
-        shift = torch.tan(offset / half)
+        shift = torch.atanh(offset / half)
         return torch.tanh(z + shift) * half - offset
     
     def quantize(self, z:Tensor) -> Tensor:
-        """Quanitzes z, returns quantized zhat, same shape as z."""
-        quantized = z + (torch.round(self.bound(z)) - z).detach()
+        z = self.bound(z)
+        quantized = z + (torch.round(z) - z).detach()
 
         # Renormalize to [-1, 1].
         half = self.levels // 2
