@@ -154,7 +154,7 @@ def main(**config):
         outdir = Path(f"checkpoint/{config['name']}")
         if not outdir.exists():
             outdir.mkdir(parents=True)
-        accelerator.save_model(G, f"checkpoint/{config["name"]}")
+        accelerator.save_model(G, f"checkpoint/{config['name']}")
 
 
 if __name__ == "__main__":
