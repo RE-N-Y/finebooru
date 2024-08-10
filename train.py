@@ -128,6 +128,8 @@ def main(**config):
     G, P, Gtx, scheduler, dataloader = accelerator.prepare(G, P, Gtx, scheduler, dataloader)
 
     for epoch in tqdm(range(42)):
+        accelerator.save_model(G, f"checkpoint/{config['name']}")
+    
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             losses = { "G" : 0 }
             reals = batch["images"]
@@ -150,11 +152,6 @@ def main(**config):
                     reals, fakes = (reals + 1) / 2, (fakes + 1) / 2
                     reals, fakes = reals.clamp(0,1), fakes.clamp(0,1)
                     accelerator.log({ "samples" : wandb.Image(fakes), "reals" : wandb.Image(reals) })
-        
-        outdir = Path(f"checkpoint/{config['name']}")
-        if not outdir.exists():
-            outdir.mkdir(parents=True)
-        accelerator.save_model(G, f"checkpoint/{config['name']}")
 
 
 if __name__ == "__main__":
