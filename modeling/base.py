@@ -600,10 +600,11 @@ class CVQVAE(nn.Module):
         self.decoder = nn.Sequential(*layers)
         self.output = nn.Conv2d(features, 3, 3, padding=1, bias=bias)
 
-    def forward(self, x):
+    def forward(self, x, passthrough=False):
         x = self.encoder(self.input(x))
         codes, loss, idxes = self.quantiser(x)
-        x = self.output(self.decoder(codes))
+        x = x if passthrough else codes
+        x = self.output(self.decoder(x))
 
         return x, loss, idxes
 
@@ -637,7 +638,7 @@ class VQVAE(nn.Module):
         self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.encoder = nn.Sequential(*[*transformers, nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        self.encoder = nn.Sequential(*[*transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
 
         # quantiser
         if quantiser == "vq":
@@ -653,29 +654,162 @@ class VQVAE(nn.Module):
         
         # decoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.decoder = nn.Sequential(*[*transformers, nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        self.decoder = nn.Sequential(*[*transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
         # pixelshuffle
         self.output = nn.Linear(features, 3 * patch * patch, bias=bias)
 
-    def initialise(self):
-        def base(m):
-            if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
-        
-        self.apply(base)
-        nn.init.xavier_uniform_(self.input.weight.view(self.features, -1))
-
-
-    def forward(self, x):
+    def forward(self, x, passthrough=False):
         x = rearrange(self.input(x), 'b c h w -> b (h w) c')
 
         x = self.encoder(self.epe(x))
         codes, loss, idxes = self.quantiser(x)
-        x = self.decoder(self.dpe(codes))
+        x = x if passthrough else codes
+        x = self.decoder(self.dpe(x))
 
         x = self.output(x)
         x = rearrange(x, 'b (h w) (c hr wr) -> b c (h hr) (w wr)', h=self.ntoken, w=self.ntoken, hr=self.patch, wr=self.patch, c=3)
+
+        return x, loss, idxes
+
+
+class TikTok(nn.Module):
+    def __init__(self, features:int=768, backbone="attention", quantiser="vq", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=False, temperature=0.1, dims:int=[8,8,8,6,5]):
+        super().__init__()
+        self.features = features
+        self.size = size
+        self.patch = patch
+        self.strides = strides
+
+        self.ntoken = (size // strides)
+        self.tokens = 32
+        scale = 1 / math.sqrt(features)
+        self.latent = nn.Parameter(scale * torch.randn(self.tokens, features))
+        self.mask = nn.Parameter(scale * torch.randn(features))
+
+        self.epe = WPE(features, self.ntoken ** 2 + self.tokens)
+        self.dpe = WPE(features, self.ntoken ** 2 + self.tokens)
+
+        if backbone == "attention":
+            Block = Transformer
+        elif backbone == "ssd":
+            Block = SSD
+        elif backbone == "bssd":
+            Block = BSSD
+        else:
+            raise ValueError(f"Unsupported backbone {backbone}")
+
+        # patchify
+        self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
+        # encoder
+        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
+        self.encoder = nn.Sequential(*[RMSNorm(features), *transformers, RMSNorm(features)])
+        # quantiser
+        if quantiser == "vq":
+            self.quantiser = VectorQuantiser(features, codes, pages)
+        elif quantiser == "lfq":
+            self.quantiser = LFQuantiser(features, codes, pages, temperature=temperature)
+        elif quantiser == "gumbel":
+            self.quantiser = GumbelQuantiser(features, codes, pages)
+        elif quantiser == "fsq":
+            self.quantiser = FSQuantiser(features, codes, pages, levels=dims)
+        else:
+            raise ValueError(f"Unknown quantiser {quantiser}")
+
+        # decoder
+        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
+        self.decoder = nn.Sequential(*[RMSNorm(features), *transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        # pixelshuffle
+        self.output = nn.Linear(features, 3 * patch * patch, bias=bias)
+
+    def forward(self, x, passthrough=False):
+        b, c, h, w = x.shape
+        x = rearrange(self.input(x), 'b c h w -> b (h w) c')
+        latents = repeat(self.latent, 't d -> b t d', b=b)
+        x = torch.cat((x, latents), dim=1)
+        x = self.encoder(self.epe(x))
+        
+        # only quantise the latents
+        codes, loss, idxes = self.quantiser(x[:, -self.tokens:, :])
+        x = x[:, :-self.tokens, :] if passthrough else codes
+        masks = repeat(self.mask, 'd -> b t d', b=b, t=self.ntoken ** 2)
+        x = torch.cat((masks, x), dim=1)
+        x = self.decoder(self.dpe(x))
+
+        # only output the non-latent part
+        x = self.output(x[:, :-self.tokens, :])
+        x = rearrange(x, 'b (h w) (c hr wr) -> b c (h hr) (w wr)', h=self.ntoken, w=self.ntoken, hr=self.patch, wr=self.patch, c=3)
+
+        return x, loss, idxes
+        
+
+class CTikTok(nn.Module):
+    def __init__(self, features:int=192, heads:int=12, codes:int=32, pages:int=8192, size:int=256, levels=3, bias=False, quantiser="vq", dims:int=[8,8,8,6,5], temperature=0.1):
+        super().__init__()
+        self.size = size
+
+        mults = [1, 1, 2, 2, 4]
+        maxmult = mults[levels]
+
+        self.levels = levels
+        self.mults = mults[:levels]
+        self.stacks = 2
+        
+        self.tokens = 32
+        scale = 1 / math.sqrt(features * maxmult)
+        self.latent = nn.Parameter(scale * torch.randn(self.tokens, features * maxmult))
+        self.mask = nn.Parameter(scale * torch.randn(features * maxmult))
+
+        self.input = nn.Conv2d(3, features, 3, padding=1, bias=bias)
+
+        layers = []
+        for ins, outs in zip(self.mults[:-1], self.mults[1:]):
+            layers.extend([Downsample(), nn.Conv2d(features * ins, features * outs, 3, padding=1, bias=bias)])
+            layers.extend([NeXtformer(features * outs) for _ in range(self.stacks)])
+            size = size // 2
+
+        layers.extend([Rearrange('b c h w -> b (h w) c'), Transformer(features * maxmult, heads=heads, bias=bias)])
+
+        self.encoder = nn.Sequential(*layers)
+        self.enmixer = nn.Sequential(*[Transformer(features * maxmult, heads=heads, bias=bias) for _ in range(3)])
+        if quantiser == "vq":
+            self.quantiser = VectorQuantiser(features * maxmult, codes, pages)
+        elif quantiser == "lfq":
+            self.quantiser = LFQuantiser(features * maxmult, codes, pages, temperature=temperature)
+        elif quantiser == "gumbel":
+            self.quantiser = GumbelQuantiser(features * maxmult, codes, pages)
+        elif quantiser == "fsq":
+            self.quantiser = FSQuantiser(features * maxmult, codes, pages, levels=dims)
+        else:
+            raise ValueError(f"Unknown quantiser {quantiser}")
+        
+        self.demixer = nn.Sequential(*[Transformer(features * maxmult, heads=heads, bias=bias) for _ in range(3)])
+        layers = []
+        layers.extend([Transformer(features * maxmult, heads=heads, bias=bias), Rearrange('b (h w) c -> b c h w', h=size, w=size)])
+
+        rmults = self.mults[::-1]
+        for ins, outs in zip(rmults[:-1], rmults[1:]):
+            size *= 2
+            layers.extend([NeXtformer(features * ins) for _ in range(self.stacks)])
+            layers.extend([Upsample(), nn.Conv2d(features * ins, features * outs, 3, padding=1, bias=bias)])
+        
+        self.decoder = nn.Sequential(*layers)
+        self.output = nn.Conv2d(features, 3, 3, padding=1, bias=bias)
+
+    def forward(self, x, passthrough=False):
+        b, c, h, w = x.shape
+        x = self.encoder(self.input(x))
+        
+        latents = repeat(self.latent, 't d -> b t d', b=b)
+
+        b, t, d = x.shape
+        x = torch.cat((x, latents), dim=1)
+        x = self.enmixer(x)
+
+        codes, loss, idxes = self.quantiser(x[:, -self.tokens:, :])
+        x = x[:, :-self.tokens, :] if passthrough else codes
+        
+        masks = repeat(self.mask, 'd -> b t d', b=b, t=t)
+        x = torch.cat((masks, x), dim=1)
+        x = self.output(self.decoder(x[:, :-self.tokens, :]))
 
         return x, loss, idxes

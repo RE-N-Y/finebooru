@@ -11,7 +11,7 @@ import deeplake
 from dreamsim import dreamsim
 from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
-from modeling.base import VQVAE, CVQVAE
+from modeling.base import VQVAE, CVQVAE, TikTok, CTikTok
 
 import math
 import click
@@ -19,8 +19,8 @@ from functools import partial
 from tqdm import tqdm
 from pathlib import Path
 
-def GLoss(G, P, reals):
-    fakes, compress, idxes = G(reals)
+def GLoss(G, P, reals, passthrough=False):
+    fakes, compress, idxes = G(reals, passthrough)
     l1 = torch.abs(fakes - reals)
     l2 = torch.square(fakes - reals)
     perceptual = P(reals, fakes)
@@ -59,6 +59,7 @@ def GLoss(G, P, reals):
 @click.option("--log_every_n_steps", default=1024, type=int)
 @click.option("--depth", default=12, type=int)
 @click.option("--dims", default=[8,8,8,6,5], type=list[int])
+@click.option("--passthrough", default=8192, type=int)
 def main(**config):
     torch.set_float32_matmul_precision('high')
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
@@ -87,6 +88,33 @@ def main(**config):
             strides=config["strides"], 
             padding=config["padding"],
             quantiser=config["quantiser"],
+            temperature=config["temperature"],
+            dims=config["dims"]
+        )
+    elif config["backbone"] in ["tiktok-attention", "tiktok-ssd", "tiktok-bssd"]:
+        _, backbone = config["backbone"].split("-")
+        G = TikTok(
+            backbone=backbone,
+            features=config["features"],
+            heads=config["heads"],
+            codes=config["codes"],
+            pages=config["pages"],
+            depth=config["depth"],
+            patch=config["patch"], 
+            size=config["size"],
+            strides=config["strides"], 
+            padding=config["padding"],
+            quantiser=config["quantiser"],
+            temperature=config["temperature"],
+            dims=config["dims"]
+        )
+    elif config["backbone"] in ["tiktok-convolution"]:
+        G = CTikTok(
+            features=config["features"], 
+            codes=config["codes"], 
+            pages=config["pages"], 
+            size=config["size"], 
+            quantiser=config["quantiser"], 
             temperature=config["temperature"],
             dims=config["dims"]
         )
@@ -120,12 +148,11 @@ def main(**config):
         G, P = torch.compile(G), torch.compile(P)
 
     Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(0.9, 0.95))
-    scheduler = get_cosine_schedule_with_warmup(Gtx, 1024, config["epochs"] * len(dataloader))
 
     size = sum(p.numel() for p in G.parameters() if p.requires_grad) / 1e+6
     accelerator.log({ "parameters" : size })
 
-    G, P, Gtx, scheduler, dataloader = accelerator.prepare(G, P, Gtx, scheduler, dataloader)
+    G, P, Gtx, dataloader = accelerator.prepare(G, P, Gtx, dataloader)
 
     for epoch in tqdm(range(42)):
         accelerator.save_model(G, f"checkpoint/{config['name']}")
@@ -133,14 +160,14 @@ def main(**config):
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             losses = { "G" : 0 }
             reals = batch["images"]
+            passthrough = idx < config["passthrough"]
 
             with accelerator.accumulate(G):
-                output = GLoss(G, P, reals)
+                output = GLoss(G, P, reals, passthrough=passthrough)
                 losses["G"] = output["loss"]
                 accelerator.backward(losses["G"])
 
                 Gtx.step()
-                scheduler.step()
                 Gtx.zero_grad()
                 
 
@@ -148,7 +175,7 @@ def main(**config):
 
             if idx % config["log_every_n_steps"] == 0:
                 with torch.no_grad():
-                    fakes, _, _ = G(reals)
+                    fakes, _, _ = G(reals, passthrough=passthrough)
                     reals, fakes = (reals + 1) / 2, (fakes + 1) / 2
                     reals, fakes = reals.clamp(0,1), fakes.clamp(0,1)
                     accelerator.log({ "samples" : wandb.Image(fakes), "reals" : wandb.Image(reals) })
