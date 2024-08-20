@@ -637,7 +637,7 @@ class VQVAE(nn.Module):
         self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.encoder = nn.Sequential(*[*transformers, nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        self.encoder = nn.Sequential(*transformers)
 
         # quantiser
         if quantiser == "vq":
@@ -653,19 +653,33 @@ class VQVAE(nn.Module):
         
         # decoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.decoder = nn.Sequential(*[*transformers, nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        self.decoder = nn.Sequential(*transformers)
         # pixelshuffle
-        self.output = nn.Linear(features, 3 * patch * patch, bias=bias)
+        self.output = nn.Sequential(
+            RMSNorm(features),
+            Rearrange('b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken),
+            nn.Conv2d(features, 4 * features, 3, padding=1, bias=bias),
+            nn.Tanh(),
+            nn.Conv2d(4 * features, features, 3, padding=1, bias=bias)
+        )
+
+        self.outconv = nn.Sequential(
+            nn.Conv2d(features, 3 * patch ** 2, 1, padding=0, bias=bias),
+            nn.PixelShuffle(patch),
+            nn.Conv2d(3, 3, 3, padding=1, bias=bias)
+        )
+
+        self.initialise()
 
     def initialise(self):
         def base(m):
             if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
+                torch.nn.init.normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     torch.nn.init.zeros_(m.bias)
         
         self.apply(base)
-        nn.init.xavier_uniform_(self.input.weight.view(self.features, -1))
+        nn.init.normal_(self.input.weight.view(self.features, -1), std=0.02)
 
 
     def forward(self, x):
@@ -675,7 +689,6 @@ class VQVAE(nn.Module):
         codes, loss, idxes = self.quantiser(x)
         x = self.decoder(self.dpe(codes))
 
-        x = self.output(x)
-        x = rearrange(x, 'b (h w) (c hr wr) -> b c (h hr) (w wr)', h=self.ntoken, w=self.ntoken, hr=self.patch, wr=self.patch, c=3)
+        x = self.outconv(self.output(x))
 
         return x, loss, idxes

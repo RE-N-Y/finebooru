@@ -59,6 +59,10 @@ def GLoss(G, P, reals):
 @click.option("--log_every_n_steps", default=1024, type=int)
 @click.option("--depth", default=12, type=int)
 @click.option("--dims", default=[8,8,8,6,5], type=list[int])
+@click.option("--beta1", default=0.9, type=float)
+@click.option("--beta2", default=0.95, type=float)
+@click.option("--wd", default=1e-4, type=float)
+@click.option("--save", default=False, type=bool)
 def main(**config):
     torch.set_float32_matmul_precision('high')
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
@@ -111,7 +115,7 @@ def main(**config):
         num_workers=16, batch_size=config["batch_size"],
         decode_method={ "images":"numpy" },
         drop_last=True,
-        buffer_size=4096,
+        buffer_size=8192,
         use_local_cache=True,
         shuffle=True
     )
@@ -119,16 +123,14 @@ def main(**config):
     if config["compile"]:
         G, P = torch.compile(G), torch.compile(P)
 
-    Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(0.9, 0.95))
-    scheduler = get_cosine_schedule_with_warmup(Gtx, 1024, config["epochs"] * len(dataloader))
-
+    Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
     size = sum(p.numel() for p in G.parameters() if p.requires_grad) / 1e+6
     accelerator.log({ "parameters" : size })
 
-    G, P, Gtx, scheduler, dataloader = accelerator.prepare(G, P, Gtx, scheduler, dataloader)
+    G, P, Gtx, dataloader = accelerator.prepare(G, P, Gtx, dataloader)
 
     for epoch in tqdm(range(42)):
-        accelerator.save_model(G, f"checkpoint/{config['name']}")
+        if config["save"] : accelerator.save_model(G, f"checkpoint/{config['name']}")
     
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             losses = { "G" : 0 }
@@ -140,7 +142,6 @@ def main(**config):
                 accelerator.backward(losses["G"])
 
                 Gtx.step()
-                scheduler.step()
                 Gtx.zero_grad()
                 
 
@@ -152,6 +153,12 @@ def main(**config):
                     reals, fakes = (reals + 1) / 2, (fakes + 1) / 2
                     reals, fakes = reals.clamp(0,1), fakes.clamp(0,1)
                     accelerator.log({ "samples" : wandb.Image(fakes), "reals" : wandb.Image(reals) })
+            
+            if idx > config["steps"]:
+                accelerator.end_training()
+                return
+            
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
