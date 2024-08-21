@@ -59,7 +59,7 @@ def GLoss(G, P, reals, passthrough=False):
 @click.option("--log_every_n_steps", default=1024, type=int)
 @click.option("--depth", default=12, type=int)
 @click.option("--dims", default=[8,8,8,6,5], type=list[int])
-@click.option("--passthrough", default=8192, type=int)
+@click.option("--passthrough", default=-1, type=int)
 def main(**config):
     torch.set_float32_matmul_precision('high')
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
