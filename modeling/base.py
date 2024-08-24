@@ -519,11 +519,23 @@ class Attention(nn.Module):
     def __init__(self, features:int, heads:int, bias=False):
         super().__init__()
         # attention implementation
-        self.attention = nn.MultiheadAttention(features, heads, bias=bias)
+        self.attention = nn.MultiheadAttention(features, heads, bias=bias, batch_first=True)
         self.out = nn.Linear(features, features)
 
     def forward(self, x):
         x, attn = self.attention(x, x, x) # q k v
+        x = self.out(x)
+        return x
+    
+class CrossAttention(nn.Module):
+    def __init__(self, features:int, heads:int, bias=False):
+        super().__init__()
+        # attention implementation
+        self.attention = nn.MultiheadAttention(features, heads, bias=bias, batch_first=True)
+        self.out = nn.Linear(features, features)
+
+    def forward(self, x, c):
+        x, attn = self.attention(x, c, c) # q k v
         x = self.out(x)
         return x
 
@@ -537,6 +549,20 @@ class Transformer(nn.Module):
 
     def forward(self, x):
         x = self.attention(self.prenorm(x)) + x
+        x = self.mlp(self.postnorm(x)) + x
+        return x
+    
+class Crossformer(nn.Module):
+    def __init__(self, features:int, heads:int=12, bias=False):
+        super().__init__()
+        self.attention = CrossAttention(features, heads, bias=bias)
+        self.cnorm = RMSNorm(features)
+        self.prenorm = RMSNorm(features)
+        self.postnorm = RMSNorm(features)
+        self.mlp = SwiGLU(features, bias=bias)
+
+    def forward(self, x, c):
+        x = self.attention(self.prenorm(x), self.cnorm(c)) + x
         x = self.mlp(self.postnorm(x)) + x
         return x
 
@@ -638,7 +664,7 @@ class VQVAE(nn.Module):
         self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.encoder = nn.Sequential(*[*transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        self.encoder = nn.Sequential(*transformers)
 
         # quantiser
         if quantiser == "vq":
@@ -654,7 +680,7 @@ class VQVAE(nn.Module):
         
         # decoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.decoder = nn.Sequential(*[*transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        self.decoder = nn.Sequential(*transformers)
         # pixelshuffle
         self.output = nn.Linear(features, 3 * patch * patch, bias=bias)
 
@@ -702,7 +728,7 @@ class TikTok(nn.Module):
         self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.encoder = nn.Sequential(*[RMSNorm(features), *transformers, RMSNorm(features)])
+        self.encoder = nn.Sequential(*transformers)
         # quantiser
         if quantiser == "vq":
             self.quantiser = VectorQuantiser(features, codes, pages)
@@ -717,9 +743,9 @@ class TikTok(nn.Module):
 
         # decoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.decoder = nn.Sequential(*[RMSNorm(features), *transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features)])
+        self.decoder = nn.Sequential(*transformers)
         # pixelshuffle
-        self.output = nn.Linear(features, 3 * patch * patch, bias=bias)
+        self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
 
     def forward(self, x, passthrough=False):
         b, c, h, w = x.shape
@@ -736,14 +762,14 @@ class TikTok(nn.Module):
         x = self.decoder(self.dpe(x))
 
         # only output the non-latent part
-        x = self.output(x[:, :-self.tokens, :])
-        x = rearrange(x, 'b (h w) (c hr wr) -> b c (h hr) (w wr)', h=self.ntoken, w=self.ntoken, hr=self.patch, wr=self.patch, c=3)
+        x = rearrange(x[:, :-self.tokens, :], 'b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken)
+        x = self.output(x)
 
         return x, loss, idxes
         
 
 class CTikTok(nn.Module):
-    def __init__(self, features:int=192, heads:int=12, codes:int=32, pages:int=8192, size:int=256, levels=3, bias=False, quantiser="vq", dims:int=[8,8,8,6,5], temperature=0.1):
+    def __init__(self, features:int=192, heads:int=6, codes:int=32, pages:int=8192, size:int=256, levels=3, bias=False, quantiser="vq", dims:int=[8,8,8,6,5], temperature=0.1):
         super().__init__()
         self.size = size
 
@@ -770,7 +796,9 @@ class CTikTok(nn.Module):
         layers.extend([Rearrange('b c h w -> b (h w) c'), Transformer(features * maxmult, heads=heads, bias=bias)])
 
         self.encoder = nn.Sequential(*layers)
+        self.encross = Crossformer(features * maxmult, heads=heads, bias=bias)
         self.enmixer = nn.Sequential(*[Transformer(features * maxmult, heads=heads, bias=bias) for _ in range(3)])
+
         if quantiser == "vq":
             self.quantiser = VectorQuantiser(features * maxmult, codes, pages)
         elif quantiser == "lfq":
@@ -782,6 +810,7 @@ class CTikTok(nn.Module):
         else:
             raise ValueError(f"Unknown quantiser {quantiser}")
         
+        self.decross = Crossformer(features * maxmult, heads=heads, bias=bias)
         self.demixer = nn.Sequential(*[Transformer(features * maxmult, heads=heads, bias=bias) for _ in range(3)])
         layers = []
         layers.extend([Transformer(features * maxmult, heads=heads, bias=bias), Rearrange('b (h w) c -> b c h w', h=size, w=size)])
@@ -802,14 +831,15 @@ class CTikTok(nn.Module):
         latents = repeat(self.latent, 't d -> b t d', b=b)
 
         b, t, d = x.shape
-        x = torch.cat((x, latents), dim=1)
+        x = self.encross(latents, x)
         x = self.enmixer(x)
 
-        codes, loss, idxes = self.quantiser(x[:, -self.tokens:, :])
-        x = x[:, :-self.tokens, :] if passthrough else codes
+        codes, loss, idxes = self.quantiser(x)        
         
         masks = repeat(self.mask, 'd -> b t d', b=b, t=t)
-        x = torch.cat((masks, x), dim=1)
-        x = self.output(self.decoder(x[:, :-self.tokens, :]))
+        x = self.decross(masks, codes)
+        x = self.demixer(x)
+        
+        x = self.output(self.decoder(x))
 
         return x, loss, idxes
