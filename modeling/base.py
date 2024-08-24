@@ -524,7 +524,7 @@ class Attention(nn.Module):
     def __init__(self, features:int, heads:int, bias=False):
         super().__init__()
         # attention implementation
-        self.attention = nn.MultiheadAttention(features, heads, bias=bias)
+        self.attention = nn.MultiheadAttention(features, heads, bias=bias, batch_first=True)
         self.out = nn.Linear(features, features)
 
     def forward(self, x):
@@ -678,13 +678,14 @@ class VQVAE(nn.Module):
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
         self.decoder = nn.Sequential(*transformers)
         # convup
-        decoders = []
-        for _ in range(int(math.log2(self.strides))):
-            decoders.extend([NeXtformer(features) for _ in range(3)])
-            decoders.extend([Upsample(), nn.Conv2d(features, features // 2, 3, padding=1, bias=bias)])
-            features //= 2
+        # decoders = []
+        # for _ in range(int(math.log2(self.strides))):
+        #     decoders.extend([NeXtformer(features) for _ in range(3)])
+        #     decoders.extend([Upsample(), nn.Conv2d(features, features // 2, 3, padding=1, bias=bias)])
+        #     features //= 2
             
-        self.output = nn.Sequential(*decoders, CRMSNorm(features), nn.Conv2d(features, 3, 3, padding=1, bias=bias))
+        # self.output = nn.Sequential(*decoders, CRMSNorm(features), nn.Conv2d(features, 3, 3, padding=1, bias=bias))
+        self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
 
         # self.initialise()
 
