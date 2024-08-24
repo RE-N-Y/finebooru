@@ -697,6 +697,77 @@ class VQVAE(nn.Module):
 
         return x, loss, idxes
 
+class PTikTok(nn.Module):
+    def __init__(self, features:int=768, backbone="attention", quantiser="vq", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=False, temperature=0.1, dims:int=[8,8,8,6,5]):
+        super().__init__()
+        self.features = features
+        self.size = size
+        self.patch = patch
+        self.strides = strides
+
+        self.ntoken = (size // strides)
+        self.tokens = 32
+        scale = 1 / math.sqrt(features)
+        
+        self.latent = nn.Parameter(scale * torch.randn(self.tokens, features))
+        self.mask = nn.Parameter(scale * torch.randn(self.ntoken ** 2, features))
+
+        self.epe = WPE(features, self.tokens)
+        self.dpe = WPE(features, self.ntoken ** 2)
+
+        if backbone == "attention":
+            Block = Transformer
+        elif backbone == "ssd":
+            Block = SSD
+        elif backbone == "bssd":
+            Block = BSSD
+        else:
+            raise ValueError(f"Unsupported backbone {backbone}")
+
+        # patchify
+        self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
+        self.crossinput = Crossformer(features, heads=heads, bias=bias)
+        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
+        self.encoder = nn.Sequential(*transformers)
+
+        # quantiser
+        if quantiser == "vq":
+            self.quantiser = VectorQuantiser(features, codes, pages)
+        elif quantiser == "lfq":
+            self.quantiser = LFQuantiser(features, codes, pages, temperature=temperature)
+        elif quantiser == "gumbel":
+            self.quantiser = GumbelQuantiser(features, codes, pages)
+        elif quantiser == "fsq":
+            self.quantiser = FSQuantiser(features, codes, pages, levels=dims)
+        else:
+            raise ValueError(f"Unknown quantiser {quantiser}")
+
+        # decoder
+        self.crossoutput = Crossformer(features, heads=heads, bias=bias)
+        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
+        self.decoder = nn.Sequential(*transformers)
+        # pixelshuffle
+        self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
+
+
+    def forward(self, x, passthrough=False):
+        b, c, h, w = x.shape
+        x = rearrange(self.input(x), 'b c h w -> b (h w) c')
+        latents = repeat(self.latent, 't d -> b t d', b=b)
+        x = self.crossinput(latents, x)
+        x = self.encoder(self.epe(x))
+
+        codes, loss, idxes = self.quantiser(x)
+        x = x if passthrough else codes
+
+        masks = repeat(self.mask, 't d -> b t d', b=b)
+        x = self.crossoutput(masks, x)
+        x = self.decoder(self.dpe(x))
+
+        x = rearrange(x, 'b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken)
+        x = self.output(x)
+
+        return x, loss, idxes
 
 class TikTok(nn.Module):
     def __init__(self, features:int=768, backbone="attention", quantiser="vq", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=False, temperature=0.1, dims:int=[8,8,8,6,5]):
@@ -783,8 +854,7 @@ class CTikTok(nn.Module):
         self.tokens = 32
         scale = 1 / math.sqrt(features * maxmult)
         self.latent = nn.Parameter(scale * torch.randn(self.tokens, features * maxmult))
-        self.mask = nn.Parameter(scale * torch.randn(features * maxmult))
-
+        
         self.input = nn.Conv2d(3, features, 3, padding=1, bias=bias)
 
         layers = []
@@ -793,11 +863,9 @@ class CTikTok(nn.Module):
             layers.extend([NeXtformer(features * outs) for _ in range(self.stacks)])
             size = size // 2
 
-        layers.extend([Rearrange('b c h w -> b (h w) c'), Transformer(features * maxmult, heads=heads, bias=bias)])
-
+        layers.append(Rearrange('b c h w -> b (h w) c'))
         self.encoder = nn.Sequential(*layers)
-        self.encross = Crossformer(features * maxmult, heads=heads, bias=bias)
-        self.enmixer = nn.Sequential(*[Transformer(features * maxmult, heads=heads, bias=bias) for _ in range(3)])
+        self.enmixers = nn.Sequential(*[Transformer(features * maxmult, heads=heads, bias=bias) for _ in range(6)])
 
         if quantiser == "vq":
             self.quantiser = VectorQuantiser(features * maxmult, codes, pages)
@@ -810,11 +878,11 @@ class CTikTok(nn.Module):
         else:
             raise ValueError(f"Unknown quantiser {quantiser}")
         
-        self.decross = Crossformer(features * maxmult, heads=heads, bias=bias)
-        self.demixer = nn.Sequential(*[Transformer(features * maxmult, heads=heads, bias=bias) for _ in range(3)])
+        self.mask = nn.Parameter(scale * torch.randn(size ** 2, features * maxmult))
+        self.demixers = nn.Sequential(*[Transformer(features * maxmult, heads=heads, bias=bias) for _ in range(6)])
+        
         layers = []
-        layers.extend([Transformer(features * maxmult, heads=heads, bias=bias), Rearrange('b (h w) c -> b c h w', h=size, w=size)])
-
+        layers.append(Rearrange('b (h w) c -> b c h w', h=size, w=size))
         rmults = self.mults[::-1]
         for ins, outs in zip(rmults[:-1], rmults[1:]):
             size *= 2
@@ -829,17 +897,11 @@ class CTikTok(nn.Module):
         x = self.encoder(self.input(x))
         
         latents = repeat(self.latent, 't d -> b t d', b=b)
-
-        b, t, d = x.shape
-        x = self.encross(latents, x)
-        x = self.enmixer(x)
-
-        codes, loss, idxes = self.quantiser(x)        
+        x = self.enmixers(torch.cat((x, latents), dim=1))
+        codes, loss, idxes = self.quantiser(x[:, -self.tokens:, :]) # only quantise the latents        
         
-        masks = repeat(self.mask, 'd -> b t d', b=b, t=t)
-        x = self.decross(masks, codes)
-        x = self.demixer(x)
-        
-        x = self.output(self.decoder(x))
+        masks = repeat(self.mask, 't d -> b t d', b=b)
+        x = self.demixers(torch.cat((masks, codes), dim=1)) 
+        x = self.output(self.decoder(x[:, :-self.tokens, :])) # only output the non-latent part
 
         return x, loss, idxes

@@ -11,7 +11,7 @@ import deeplake
 from dreamsim import dreamsim
 from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
-from modeling.base import VQVAE, CVQVAE, TikTok, CTikTok
+from modeling.base import VQVAE, CVQVAE, TikTok, CTikTok, PTikTok
 
 import math
 import click
@@ -106,6 +106,21 @@ def main(**config):
             padding=config["padding"],
             quantiser=config["quantiser"],
             temperature=config["temperature"],
+            dims=config["dims"]
+        )
+    elif config["backbone"] in ["tiktok-perceiver"]:
+        G = PTikTok(
+            backbone="attention",
+            features=config["features"],
+            heads=config["heads"],
+            codes=config["codes"],
+            pages=config["pages"],
+            depth=config["depth"],
+            patch=config["patch"], 
+            size=config["size"],
+            strides=config["strides"], 
+            padding=config["padding"],
+            quantiser=config["quantiser"],
             dims=config["dims"]
         )
     elif config["backbone"] in ["tiktok-convolution"]:
