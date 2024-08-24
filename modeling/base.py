@@ -197,15 +197,20 @@ class CRMSNorm(nn.Module):
         return output * self.weight
 
 class SwiGLU(nn.Module):
-    def __init__(self, features:int, bias=False):
+    def __init__(self, features:int, useconv:bool=False, ntokens:int=32, bias=False):
         super().__init__()
         self.gate = nn.Linear(features, 4 * features, bias=bias)
         self.up = nn.Linear(features, 4 * features, bias=bias)
         self.down = nn.Linear(4 * features, features, bias=bias)
+        self.convolve = nn.Sequential(
+            Rearrange('b (h w) c -> b c h w', h=ntokens, w=ntokens),
+            nn.Conv2d(4 * features, 4 * features, 3, padding=1, groups=4 * features),
+            Rearrange('b c h w -> b (h w) c')
+        ) if useconv else nn.Identity()
 
     @torch.compile
     def forward(self, x):
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        return self.down(self.convolve(F.silu(self.gate(x)) * self.up(x)))
     
 
 class CSwiGLU(nn.Module):
@@ -221,12 +226,12 @@ class CSwiGLU(nn.Module):
 
 
 class SSD(nn.Module):
-    def __init__(self, features:int, heads:int, bias=False):
+    def __init__(self, features:int, heads:int, bias=False, useconv=False, ntokens:int=32):
         super().__init__()
         self.mamba = Mamba2(features)
         self.prenorm = RMSNorm(features)
         self.postnorm = RMSNorm(features)
-        self.mlp = SwiGLU(features)
+        self.mlp = SwiGLU(features, useconv=useconv, ntokens=ntokens)
 
     def forward(self, x):
         x = self.mamba(self.prenorm(x)) + x
@@ -236,7 +241,7 @@ class SSD(nn.Module):
 
 # simple bidirectional mamba similar to Bidirectional LSTM
 class BSSD(nn.Module):
-    def __init__(self, features:int, heads:int, bias=False):
+    def __init__(self, features:int, heads:int, bias=False, useconv=False, ntokens:int=32):
         super().__init__()
 
         self.fwd = Mamba2(features)
@@ -246,8 +251,8 @@ class BSSD(nn.Module):
         self.fwdnorm = RMSNorm(features)
         self.bwdnorm = RMSNorm(features)
 
-        self.fwdmlp = SwiGLU(features)
-        self.bwdmlp = SwiGLU(features)
+        self.fwdmlp = SwiGLU(features, useconv=useconv, ntokens=ntokens)
+        self.bwdmlp = SwiGLU(features, useconv=useconv, ntokens=ntokens)
 
     def forward(self, x):
         # b t d
@@ -528,17 +533,18 @@ class Attention(nn.Module):
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, features, heads:int=12, bias=False):
+    def __init__(self, features, heads:int=12, bias=False, useconv=False, ntokens:int=32):
         super().__init__()
         self.attention = Attention(features, heads, bias=bias)
         self.prenorm = RMSNorm(features)
         self.postnorm = RMSNorm(features)
-        self.mlp = SwiGLU(features, bias=bias)
+        self.mlp = SwiGLU(features, bias=bias, useconv=useconv, ntokens=ntokens)
 
     def forward(self, x):
         x = self.attention(self.prenorm(x)) + x
         x = self.mlp(self.postnorm(x)) + x
         return x
+
 
 class NeXtformer(nn.Module):
     def __init__(self, features:int, bias=False):
@@ -609,7 +615,24 @@ class CVQVAE(nn.Module):
 
 
 class VQVAE(nn.Module):
-    def __init__(self, features:int=768, backbone="attention", quantiser="vq", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=False, temperature=0.1, dims:int=[8,8,8,6,5]):
+    def __init__(
+        self, 
+        features:int=768, 
+        backbone="attention", 
+        quantiser="vq", 
+        codes:int=32, 
+        pages:int=8192,
+        heads:int=12,
+        depth:int=12,
+        patch:int=16,
+        size:int=256,
+        strides:int=16,
+        padding:int=0,
+        bias=False,
+        temperature=0.1,
+        dims:int=[8,8,8,6,5],
+        useconv=False
+    ):
         super().__init__()
         self.features = features
         self.size = size
@@ -636,7 +659,7 @@ class VQVAE(nn.Module):
         # patchify
         self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
-        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
+        transformers = [Block(features, heads=heads, bias=bias, useconv=useconv, ntokens=self.ntoken) for _ in range(depth)]
         self.encoder = nn.Sequential(*transformers)
 
         # quantiser
@@ -654,32 +677,20 @@ class VQVAE(nn.Module):
         # decoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
         self.decoder = nn.Sequential(*transformers)
-        # pixelshuffle
-        self.output = nn.Sequential(
-            RMSNorm(features),
-            Rearrange('b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken),
-            nn.Conv2d(features, 4 * features, 3, padding=1, bias=bias),
-            nn.Tanh(),
-            nn.Conv2d(4 * features, features, 3, padding=1, bias=bias)
-        )
-
-        self.outconv = nn.Sequential(
-            nn.Conv2d(features, 3 * patch ** 2, 1, padding=0, bias=bias),
-            nn.PixelShuffle(patch),
-            nn.Conv2d(3, 3, 3, padding=1, bias=bias)
-        )
-
+        # convup
+        self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
         self.initialise()
 
     def initialise(self):
         def base(m):
-            if isinstance(m, nn.Linear):
-                torch.nn.init.normal_(m.weight, std=0.02)
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
+                torch.nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     torch.nn.init.zeros_(m.bias)
         
         self.apply(base)
-        nn.init.normal_(self.input.weight.view(self.features, -1), std=0.02)
+        nn.init.trunc_normal_(self.input.weight.view(self.features, -1), std=0.02)
+        nn.init.trunc_normal_(self.output.weight.view(3, -1), std=0.02)
 
 
     def forward(self, x):
@@ -689,6 +700,7 @@ class VQVAE(nn.Module):
         codes, loss, idxes = self.quantiser(x)
         x = self.decoder(self.dpe(codes))
 
-        x = self.outconv(self.output(x))
+        x = rearrange(x, 'b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken)
+        x = self.output(x)
 
         return x, loss, idxes

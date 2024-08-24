@@ -63,6 +63,7 @@ def GLoss(G, P, reals):
 @click.option("--beta2", default=0.95, type=float)
 @click.option("--wd", default=1e-4, type=float)
 @click.option("--save", default=False, type=bool)
+@click.option("--useconv", default=False, type=bool)
 def main(**config):
     torch.set_float32_matmul_precision('high')
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
@@ -92,7 +93,8 @@ def main(**config):
             padding=config["padding"],
             quantiser=config["quantiser"],
             temperature=config["temperature"],
-            dims=config["dims"]
+            dims=config["dims"],
+            useconv=config["useconv"]
         )
     else:
         raise ValueError(f"Invalid backbone {config['backbone']}")
