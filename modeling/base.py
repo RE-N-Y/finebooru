@@ -678,19 +678,26 @@ class VQVAE(nn.Module):
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
         self.decoder = nn.Sequential(*transformers)
         # convup
-        self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
-        self.initialise()
+        decoders = []
+        for _ in range(int(math.log2(self.strides))):
+            decoders.extend([NeXtformer(features) for _ in range(3)])
+            decoders.extend([Upsample(), nn.Conv2d(features, features // 2, 3, padding=1, bias=bias)])
+            features //= 2
+            
+        self.output = nn.Sequential(*decoders, CRMSNorm(features), nn.Conv2d(features, 3, 3, padding=1, bias=bias))
 
-    def initialise(self):
-        def base(m):
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
-                torch.nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
+        # self.initialise()
+
+    # def initialise(self):
+    #     def base(m):
+    #         if isinstance(m, (nn.Linear, nn.Conv2d)):
+    #             torch.nn.init.trunc_normal_(m.weight, std=0.02)
+    #             if m.bias is not None:
+    #                 torch.nn.init.zeros_(m.bias)
         
-        self.apply(base)
-        nn.init.trunc_normal_(self.input.weight.view(self.features, -1), std=0.02)
-        nn.init.trunc_normal_(self.output.weight.view(3, -1), std=0.02)
+    #     self.apply(base)
+    #     nn.init.trunc_normal_(self.input.weight.view(self.features, -1), std=0.02)
+    #     nn.init.trunc_normal_(self.output.weight.view(3, -1), std=0.02)
 
 
     def forward(self, x):

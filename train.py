@@ -126,10 +126,11 @@ def main(**config):
         G, P = torch.compile(G), torch.compile(P)
 
     Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
+    scheduler = get_cosine_schedule_with_warmup(Gtx, 4096, config["epochs"] * len(dataloader))
     size = sum(p.numel() for p in G.parameters() if p.requires_grad) / 1e+6
     accelerator.log({ "parameters" : size })
 
-    G, P, Gtx, dataloader = accelerator.prepare(G, P, Gtx, dataloader)
+    G, P, Gtx, scheduler, dataloader = accelerator.prepare(G, P, Gtx, scheduler, dataloader)
 
     for epoch in tqdm(range(42)):
         if config["save"] : accelerator.save_model(G, f"checkpoint/{config['name']}")
@@ -144,6 +145,7 @@ def main(**config):
                 accelerator.backward(losses["G"])
 
                 Gtx.step()
+                scheduler.step()
                 Gtx.zero_grad()
                 
 
