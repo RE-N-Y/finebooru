@@ -1,0 +1,18 @@
+{
+  "bias": false,
+  "codes": 16,
+  "dims": [
+    8,
+    8,
+    8,
+    6,
+    5
+  ],
+  "features": 48,
+  "heads": 12,
+  "levels": 3,
+  "pages": 65536,
+  "quantiser": "fsq",
+  "size": 256,
+  "temperature": 1.0
+}

@@ -11,6 +11,7 @@ from einops.layers.torch import Rearrange
 from mamba_ssm import Mamba2
 from causal_conv1d import causal_conv1d_fn
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+from huggingface_hub import PyTorchModelHubMixin
 
 class Downsample(nn.Module):
     def __init__(self):
@@ -151,6 +152,13 @@ class FSQuantiser(nn.Module):
         idxes = torch.sum(codes * self.basis, dim=-1)
         return idxes.to(torch.uint32)
     
+    def codes(self, idxes:Tensor) -> Tensor:
+        half = self.levels // 2
+        idxes = rearrange(idxes, '... -> ... 1')
+        codes = (idxes // self.basis) % self.levels
+        codes = (codes - half) / codes
+        return codes
+    
     def forward(self, z):
         z = self.input(z)
         codes = self.quantize(z)
@@ -268,258 +276,6 @@ class BSSD(nn.Module):
 
         return f + b
 
-class SSDV(nn.Module):
-    def __init__(
-        self,
-        features,
-        heads=8,
-        states=64,
-        dconv=4,
-        expand=2,
-        ngroups=1,
-        chunk=256,
-        bias=False,
-    ):
-        super().__init__()
-        self.features = features
-        self.states = states
-        self.dconv = dconv
-        self.expand = expand
-        self.inner = self.expand * self.features
-        self.ngroups = ngroups
-
-        self.headdim = (self.inner // 2) // heads
-        self.nheads = heads
-        self.chunk = chunk
-
-        assert self.inner % self.headdim == 0
-
-        # Order: [z, x, B, C, dt]
-        self.inputs = nn.Linear(
-            self.features, self.inner + 2 * self.ngroups * self.states + self.nheads, 
-            bias=False
-        )
-
-        self.xconv = nn.Conv1d(
-            self.inner//2 + 2 * self.ngroups * self.states,
-            self.inner//2 + 2 * self.ngroups * self.states,
-            bias=True,
-            kernel_size=dconv,
-            groups=self.inner//2 + 2 * self.ngroups * self.states,
-            padding=dconv - 1,
-        )
-
-        self.zconv = nn.Conv1d(
-            self.inner//2,
-            self.inner//2,
-            bias=True,
-            kernel_size=dconv,
-            groups=self.inner//2,
-            padding=dconv - 1,
-        )
-
-        self.act = nn.SiLU()
-
-        # Initialize log dt bias
-        dt = torch.exp(
-            torch.rand(self.nheads, ) * (math.log(0.1) - math.log(0.001))
-            + math.log(0.001)
-        )
-        dt = torch.clamp(dt, min=1e-4)
-        
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
-        self.dt_bias._no_weight_decay = True
-
-        # A parameter
-        A = torch.empty(self.nheads, dtype=torch.float32).uniform_(1,16)
-        Alog = torch.log(A)
-
-        self.Alog = nn.Parameter(Alog)
-        self.Alog._no_weight_decay = True
-
-        # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads))
-        self.D._no_weight_decay = True
-
-        # Extra normalization layer right before output projection
-        self.norm = RMSNorm(self.inner, eps=1e-5)
-        self.output = nn.Linear(self.inner, self.features, bias=False)
-
-    def forward(self, u):
-        """
-        u: (B, L, D)
-        Returns: same shape as u
-        """
-        batch, _, _ = u.shape
-
-        zxbcdt = self.inputs(u)  # (B, L, D)
-        A = -torch.exp(self.Alog)  # (nheads) or (inner, states)
-
-        z, xBC, dt = torch.split(
-            zxbcdt, [self.inner // 2, self.inner // 2 + 2 * self.ngroups * self.states, self.nheads], dim=-1
-        )
-
-        dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
-        xBC = causal_conv1d_fn(
-            xBC.transpose(1, 2),
-            rearrange(self.xconv.weight, "d 1 w -> d w"),
-            bias=self.xconv.bias,
-            activation="silu"
-        ).transpose(1, 2)
-
-        z = causal_conv1d_fn(
-            z.transpose(1, 2),
-            rearrange(self.zconv.weight, "d 1 w -> d w"),
-            bias=self.zconv.bias,
-            activation="silu"
-        ).transpose(1, 2)
-
-        # Split into 3 main branches: X, B, C
-        # These correspond to V, K, Q respectively in the SSM/attention duality
-        x, B, C = torch.split(xBC, [self.inner//2, self.ngroups * self.states, self.ngroups * self.states], dim=-1)
-        y = mamba_chunk_scan_combined(
-            rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-            dt,
-            A,
-            rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
-            rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
-            chunk_size=self.chunk,
-            D=self.D,
-            z=None,
-        )
-        y = rearrange(y, "b l h p -> b l (h p)")
-
-        y = self.norm(torch.cat([y, z], dim=-1))
-        out = self.output(y)
-        
-        return out
-class VSSD(nn.Module):
-    def __init__(
-        self,
-        features,
-        heads=8,
-        states=64,
-        dconv=4,
-        expand=2,
-        ngroups=1,
-        chunk=256,
-        bias=False,
-    ):
-        super().__init__()
-        self.features = features
-        self.states = states
-        self.dconv = dconv
-        self.expand = expand
-        self.inner = self.expand * self.features
-        self.ngroups = ngroups
-
-        self.headdim = self.inner // heads
-        self.nheads = heads
-        self.chunk = chunk
-
-        assert self.inner % self.headdim == 0
-
-        # Order: [z, x, B, C, dt]
-        self.inputs = nn.Linear(
-            self.features, 2 * self.inner + 2 * self.ngroups * self.states + self.nheads, 
-            bias=False
-        )
-
-        self.xconv = nn.Conv1d(
-            self.inner + 2 * self.ngroups * self.states,
-            self.inner + 2 * self.ngroups * self.states,
-            bias=True,
-            kernel_size=dconv,
-            groups=self.inner + 2 * self.ngroups * self.states,
-            padding=dconv - 1,
-        )
-
-        self.zconv = nn.Conv1d(
-            self.inner,
-            self.inner,
-            bias=True,
-            kernel_size=dconv,
-            groups=self.inner,
-            padding=dconv - 1,
-        )
-
-        self.act = nn.SiLU()
-
-        # Initialize log dt bias
-        dt = torch.exp(
-            torch.rand(self.nheads, ) * (math.log(0.1) - math.log(0.001))
-            + math.log(0.001)
-        )
-        dt = torch.clamp(dt, min=1e-4)
-        
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
-        self.dt_bias._no_weight_decay = True
-
-        # A parameter
-        A = torch.empty(self.nheads, dtype=torch.float32).uniform_(1,16)
-        Alog = torch.log(A)
-
-        self.Alog = nn.Parameter(Alog)
-        self.Alog._no_weight_decay = True
-
-        # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads))
-        self.D._no_weight_decay = True
-
-        # Extra normalization layer right before output projection
-        self.norm = RMSNorm(self.inner, eps=1e-5)
-        self.output = nn.Linear(self.inner, self.features, bias=False)
-
-    def forward(self, u):
-        """
-        u: (B, L, D)
-        Returns: same shape as u
-        """
-        batch, _, _ = u.shape
-
-        zxbcdt = self.inputs(u)  # (B, L, inner)
-        A = -torch.exp(self.Alog)  # (nheads) or (inner, states)
-
-        z, xBC, dt = torch.split(
-            zxbcdt, [self.inner, self.inner + 2 * self.ngroups * self.states, self.nheads], dim=-1
-        )
-
-        dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
-        xBC = causal_conv1d_fn(
-            xBC.transpose(1, 2),
-            rearrange(self.xconv.weight, "d 1 w -> d w"),
-            bias=self.xconv.bias,
-            activation="silu"
-        ).transpose(1, 2)
-
-        z = causal_conv1d_fn(
-            z.transpose(1, 2),
-            rearrange(self.zconv.weight, "d 1 w -> d w"),
-            bias=self.zconv.bias,
-            activation="silu"
-        ).transpose(1, 2)
-
-        # Split into 3 main branches: X, B, C
-        # These correspond to V, K, Q respectively in the SSM/attention duality
-        x, B, C = torch.split(xBC, [self.inner, self.ngroups * self.states, self.ngroups * self.states], dim=-1)
-        y = mamba_chunk_scan_combined(
-            rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-            dt,
-            A,
-            rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
-            rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
-            chunk_size=self.chunk,
-            D=self.D,
-            z=None,
-        )
-        y = rearrange(y, "b l h p -> b l (h p)")
-        y = self.norm(y * z)
-        out = self.output(y)
-        
-        return out
-
 class Attention(nn.Module):
     def __init__(self, features:int, heads:int, bias=False):
         super().__init__()
@@ -561,7 +317,12 @@ class NeXtformer(nn.Module):
 
         return x  
 
-class CVQVAE(nn.Module):
+class CVQVAE(
+        nn.Module, 
+        PyTorchModelHubMixin, 
+        library_name="finebooru",
+        repo_url="https://github.com/RE-N-Y/finebooru"
+    ):
     def __init__(self, features:int=192, heads:int=12, codes:int=32, pages:int=8192, size:int=256, levels=3, bias=False, quantiser="vq", dims:int=[8,8,8,6,5], temperature=0.1):
         super().__init__()
         self.size = size
@@ -580,7 +341,7 @@ class CVQVAE(nn.Module):
             layers.extend([NeXtformer(features * outs) for _ in range(self.stacks)])
             size = size // 2
 
-        layers.extend([Rearrange('b c h w -> b (h w) c'), Transformer(features * maxmult, heads=heads, bias=bias)])
+        layers.extend([Rearrange('b c h w -> b (h w) c')])
 
         self.encoder = nn.Sequential(*layers)
         if quantiser == "vq":
@@ -595,7 +356,7 @@ class CVQVAE(nn.Module):
             raise ValueError(f"Unknown quantiser {quantiser}")
 
         layers = []
-        layers.extend([Transformer(features * maxmult, heads=heads, bias=bias), Rearrange('b (h w) c -> b c h w', h=size, w=size)])
+        layers.extend([Rearrange('b (h w) c -> b c h w', h=size, w=size)])
 
         rmults = self.mults[::-1]
         for ins, outs in zip(rmults[:-1], rmults[1:]):
@@ -612,6 +373,19 @@ class CVQVAE(nn.Module):
         x = self.output(self.decoder(codes))
 
         return x, loss, idxes
+    
+    def encode(self, x):
+        x = self.encode(self.input(x))
+        codes, loss, idxes = self.quantiser(x)
+        return codes
+    
+    def tokenise(self, x):
+        x = self.encode(self.input(x))
+        codes, loss, idxes = self.quantiser(x)
+        return idxes
+    
+    def decode(self, codes):
+        return self.output(self.decoder(codes))
 
 
 class VQVAE(nn.Module):
@@ -649,10 +423,6 @@ class VQVAE(nn.Module):
             Block = SSD
         elif backbone == "bssd":
             Block = BSSD
-        elif backbone == "vssd":
-            Block = VSSD
-        elif backbone == "ssdv":
-            Block = SSDV
         else:
             raise ValueError(f"Unknown backbone {backbone}")
 
@@ -677,29 +447,7 @@ class VQVAE(nn.Module):
         # decoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
         self.decoder = nn.Sequential(*transformers)
-        # convup
-        # decoders = []
-        # for _ in range(int(math.log2(self.strides))):
-        #     decoders.extend([NeXtformer(features) for _ in range(3)])
-        #     decoders.extend([Upsample(), nn.Conv2d(features, features // 2, 3, padding=1, bias=bias)])
-        #     features //= 2
-            
-        # self.output = nn.Sequential(*decoders, CRMSNorm(features), nn.Conv2d(features, 3, 3, padding=1, bias=bias))
         self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
-
-        # self.initialise()
-
-    # def initialise(self):
-    #     def base(m):
-    #         if isinstance(m, (nn.Linear, nn.Conv2d)):
-    #             torch.nn.init.trunc_normal_(m.weight, std=0.02)
-    #             if m.bias is not None:
-    #                 torch.nn.init.zeros_(m.bias)
-        
-    #     self.apply(base)
-    #     nn.init.trunc_normal_(self.input.weight.view(self.features, -1), std=0.02)
-    #     nn.init.trunc_normal_(self.output.weight.view(3, -1), std=0.02)
-
 
     def forward(self, x):
         x = rearrange(self.input(x), 'b c h w -> b (h w) c')

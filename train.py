@@ -8,7 +8,6 @@ import lpips
 import wandb
 import deeplake
 
-from dreamsim import dreamsim
 from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
 from modeling.base import VQVAE, CVQVAE
@@ -39,8 +38,10 @@ def GLoss(G, P, reals):
 
 @click.command()
 @click.option("--name", default="name", type=str)
+@click.option("--dataset", default="hub://activeloop/imagenet-train", type=str)
 @click.option("--backbone", default="attention", type=str)
 @click.option("--compile", default=False, type=bool)
+@click.option("--epochs", default=4, type=int)
 @click.option("--size", default=256, type=int)
 @click.option("--lr", default=3e-4, type=float)
 @click.option("--features", default=768, type=int)
@@ -63,6 +64,7 @@ def GLoss(G, P, reals):
 @click.option("--beta2", default=0.95, type=float)
 @click.option("--wd", default=1e-4, type=float)
 @click.option("--save", default=False, type=bool)
+@click.option("--push", default=False, type=bool)
 @click.option("--useconv", default=False, type=bool)
 def main(**config):
     torch.set_float32_matmul_precision('high')
@@ -79,6 +81,7 @@ def main(**config):
             temperature=config["temperature"],
             dims=config["dims"]
         )
+    
     elif config["backbone"] in ["attention", "ssd", "bssd", "vssd", "ssdv"]:
         G = VQVAE(
             backbone=config["backbone"], 
@@ -102,12 +105,13 @@ def main(**config):
     P = lpips.LPIPS(net='vgg')
     P = P.eval()
 
-    ds = deeplake.load("hub://reny/animefaces")
+    ds = deeplake.load(config["dataset"])
 
     tform = T.Compose([
         T.ToTensor(), T.Resize(config["size"], antialias=True),
         T.RandomResizedCrop(config["size"], scale=(0.8, 1), antialias=True),
         T.RandomHorizontalFlip(0.3), T.RandomAdjustSharpness(2,0.3), T.RandomAutocontrast(0.3),
+        T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)),
         T.ConvertImageDtype(torch.float), T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
     ])
 
@@ -118,7 +122,6 @@ def main(**config):
         decode_method={ "images":"numpy" },
         drop_last=True,
         buffer_size=8192,
-        use_local_cache=True,
         shuffle=True
     )
 
@@ -132,9 +135,7 @@ def main(**config):
 
     G, P, Gtx, scheduler, dataloader = accelerator.prepare(G, P, Gtx, scheduler, dataloader)
 
-    for epoch in tqdm(range(42)):
-        if config["save"] : accelerator.save_model(G, f"checkpoint/{config['name']}")
-    
+    for epoch in tqdm(range(config["epochs"])):
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             losses = { "G" : 0 }
             reals = batch["images"]
@@ -163,6 +164,13 @@ def main(**config):
                 return
             
     accelerator.end_training()
+    
+    G_ = accelerator.unwrap_model(G)
+    if config["save"]:
+        G_.save_pretrained(f"RE-N-Y/{config['name']}")
+        if config["push"]:
+            G_.push_to_hub(f"RE-N-Y/{config['name']}")
+
 
 
 if __name__ == "__main__":
