@@ -323,12 +323,12 @@ class CVQVAE(
         library_name="finebooru",
         repo_url="https://github.com/RE-N-Y/finebooru"
     ):
-    def __init__(self, features:int=192, heads:int=12, codes:int=32, pages:int=8192, size:int=256, levels=3, bias=False, quantiser="vq", dims:int=[8,8,8,6,5], temperature=0.1):
+    def __init__(self, features:int=192, heads:int=12, codes:int=32, pages:int=8192, size:int=256, levels=4, bias=False, quantiser="vq", dims:int=[8,8,8,6,5], temperature=0.1):
         super().__init__()
         self.size = size
 
-        mults = [1, 1, 2, 2, 4]
-        maxmult = mults[levels]
+        mults = [1, 1, 2, 2, 4, 4]
+        maxmult = mults[levels - 1]
 
         self.levels = levels
         self.mults = mults[:levels]
@@ -341,7 +341,7 @@ class CVQVAE(
             layers.extend([NeXtformer(features * outs) for _ in range(self.stacks)])
             size = size // 2
 
-        layers.extend([Rearrange('b c h w -> b (h w) c')])
+        layers.extend([Rearrange('b c h w -> b (h w) c'), Transformer(features * maxmult, heads=heads, bias=bias)])
 
         self.encoder = nn.Sequential(*layers)
         if quantiser == "vq":
@@ -356,7 +356,7 @@ class CVQVAE(
             raise ValueError(f"Unknown quantiser {quantiser}")
 
         layers = []
-        layers.extend([Rearrange('b (h w) c -> b c h w', h=size, w=size)])
+        layers.extend([Transformer(features * maxmult, heads=heads, bias=bias), Rearrange('b (h w) c -> b c h w', h=size, w=size)])
 
         rmults = self.mults[::-1]
         for ins, outs in zip(rmults[:-1], rmults[1:]):
