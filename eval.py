@@ -5,6 +5,8 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
 from torchmetrics.image.psnr import PeakSignalNoiseRatio
 from torchmetrics.image.inception import InceptionScore
+from torchmetrics.regression.mae import MeanAbsoluteError
+from torchmetrics.regression.mse import MeanSquaredError
 
 
 import click
@@ -57,8 +59,10 @@ def main(**config):
     PSNR = PeakSignalNoiseRatio()
     FID = FrechetInceptionDistance()
     IS = InceptionScore()
+    l1 = MeanAbsoluteError()
+    l2 = MeanSquaredError()
 
-    G, SSIM, PSNR, FID, IS, dataloader = accelerator.prepare(G, SSIM, PSNR, FID, IS, dataloader)
+    G, SSIM, PSNR, FID, IS, l1, l2, dataloader = accelerator.prepare(G, SSIM, PSNR, FID, IS, l1, l2, dataloader)
 
     for batch in tqdm(dataloader, total=len(dataloader)):
         images = batch["images"]
@@ -73,7 +77,9 @@ def main(**config):
     accelerator.log({
         "FID": FID.compute(),
         "PSNR": PSNR.compute(),
-        "IS": IS.compute()
+        "IS": IS.compute(),
+        "l1": l1.compute(),
+        "l2": l2.compute(),
     })
 
     
