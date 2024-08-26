@@ -430,7 +430,7 @@ class VQVAE(nn.Module):
         self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
         # encoder
         transformers = [Block(features, heads=heads, bias=bias, useconv=useconv, ntokens=self.ntoken) for _ in range(depth)]
-        self.encoder = nn.Sequential(*transformers)
+        self.encoder = nn.Sequential(*transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features))
 
         # quantiser
         if quantiser == "vq":
@@ -446,8 +446,11 @@ class VQVAE(nn.Module):
         
         # decoder
         transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
-        self.decoder = nn.Sequential(*transformers)
-        self.output = nn.ConvTranspose2d(features, 3, patch, stride=strides, padding=padding, bias=bias)
+        self.decoder = nn.Sequential(*transformers, RMSNorm(features), nn.Linear(features, 4 * features), nn.Tanh(), nn.Linear(4 * features, features))
+        self.output = nn.Sequential(
+            nn.Conv2d(features, 3 * patch ** 2, 1, bias=bias),
+            nn.PixelShuffle(patch)
+        )
 
     def forward(self, x):
         x = rearrange(self.input(x), 'b c h w -> b (h w) c')

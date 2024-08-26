@@ -12,6 +12,7 @@ from torchmetrics.regression.mse import MeanSquaredError
 import click
 import deeplake
 from tqdm import tqdm
+from einops import rearrange
 from accelerate import Accelerator
 from modeling.base import CVQVAE
 
@@ -48,10 +49,7 @@ def main(**config):
         tensors=["images"],
         transform={ "images" : tform },
         num_workers=16, batch_size=config["batch_size"],
-        decode_method={ "images":"numpy" },
-        drop_last=True,
-        buffer_size=8192,
-        shuffle=True
+        decode_method={ "images":"numpy" }
     )
 
     
@@ -64,6 +62,7 @@ def main(**config):
 
     G, SSIM, PSNR, FID, IS, l1, l2, dataloader = accelerator.prepare(G, SSIM, PSNR, FID, IS, l1, l2, dataloader)
 
+    flatten = lambda x : rearrange(x, "b c h w -> b (c h w)")
     for batch in tqdm(dataloader, total=len(dataloader)):
         images = batch["images"]
         with torch.inference_mode():
@@ -73,6 +72,8 @@ def main(**config):
             FID.update(images, real=True)
             PSNR.update(fakes, images)
             IS.update(fakes)
+            l1.update(flatten(fakes), flatten(images))
+            l2.update(flatten(fakes), flatten(images))
 
     accelerator.log({
         "FID": FID.compute(),

@@ -11,27 +11,55 @@ import deeplake
 from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
 from modeling.base import VQVAE, CVQVAE
+from modeling.discrminator import Discriminator
+from augmentation import daugment
 
 import math
 import click
 from functools import partial
 from tqdm import tqdm
 from pathlib import Path
+from einops import rearrange
 
-def GLoss(G, P, reals):
+identity = lambda t : t
+vjp = partial(torch.autograd.grad, create_graph=True, retain_graph=True, only_inputs=True)
+differentiable = lambda f : f.requires_grad_(True)
+
+def DRLoss(D, reals:Tensor, steps=4, weight=1.):
+    y = D(differentiable(reals))
+    ones = torch.ones(y.shape, device=y.device, dtype=y.dtype)
+    gradients, *_ = vjp(outputs=y, inputs=reals, grad_outputs=ones)
+    gradients = rearrange(gradients, 'b c h w -> b (c h w)')
+    norm = gradients.norm(2, dim=-1)
+    penalty = (norm - 1) ** 2
+
+    loss = .5 * weight * steps * penalty
+    return loss.mean()
+
+
+def DLoss(G, D, reals, augmentation=identity):
+    fakes, loss, idxes = G(reals)
+    fscores = D(augmentation(fakes))
+    rscores = D(augmentation(reals))
+    loss = F.softplus(fscores) + F.softplus(-rscores)
+
+    return loss.mean()
+
+def GLoss(G, D, P, reals, augmentation=identity):
     fakes, compress, idxes = G(reals)
     l1 = torch.abs(fakes - reals)
     l2 = torch.square(fakes - reals)
     perceptual = P(reals, fakes)
+    adversarial = F.softplus(-D(augmentation(fakes)))
 
-    loss =  1 * compress + \
-           .1 * perceptual.mean() + \
+    loss = .1 * perceptual.mean() + \
+           .1 * adversarial.mean() + \
             1 * l2.mean()
-            
-    return {
-        "loss":loss,
-        "compress":compress,
-        "perceptual":perceptual.mean(),
+
+    return { 
+        "loss":loss, 
+        "perceptual":perceptual.mean(), 
+        "adversarial":adversarial.mean(), 
         "l2":l2.mean(),
         "l1":l1.mean(),
     }
@@ -61,7 +89,7 @@ def GLoss(G, P, reals):
 @click.option("--depth", default=12, type=int)
 @click.option("--dims", default=[8,8,8,6,5], type=list[int])
 @click.option("--beta1", default=0.9, type=float)
-@click.option("--beta2", default=0.95, type=float)
+@click.option("--beta2", default=0.99, type=float)
 @click.option("--wd", default=1e-4, type=float)
 @click.option("--save", default=False, type=bool)
 @click.option("--push", default=False, type=bool)
@@ -105,6 +133,7 @@ def main(**config):
     P = lpips.LPIPS(net='vgg')
     P = P.eval()
 
+    D = Discriminator(config["size"])
     ds = deeplake.load(config["dataset"])
 
     tform = T.Compose([
@@ -126,30 +155,41 @@ def main(**config):
     )
 
     if config["compile"]:
-        G, P = torch.compile(G), torch.compile(P)
+        G, P, D = torch.compile(G), torch.compile(P), torch.compile(D)
 
     Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
-    scheduler = get_cosine_schedule_with_warmup(Gtx, 4096, config["epochs"] * len(dataloader))
+    Dtx = torch.optim.AdamW(D.parameters(), lr = config["lr"], betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
+
+    Gscheduler = get_cosine_schedule_with_warmup(Gtx, 4096, config["epochs"] * len(dataloader))
+    Dscheduler = get_cosine_schedule_with_warmup(Dtx, 4096, config["epochs"] * len(dataloader))
     size = sum(p.numel() for p in G.parameters() if p.requires_grad) / 1e+6
     accelerator.log({ "parameters" : size })
 
-    G, P, Gtx, scheduler, dataloader = accelerator.prepare(G, P, Gtx, scheduler, dataloader)
+    G, D, P, Gtx, Dtx, Gscheduler, Dscheduler, dataloader = accelerator.prepare(G, D, P, Gtx, Dtx, Gscheduler, Dscheduler, dataloader)
 
     for epoch in tqdm(range(config["epochs"])):
+        losses = { "D" : 0, "G" : 0, "DR" : 0 }
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-            losses = { "G" : 0 }
             reals = batch["images"]
 
+            with accelerator.accumulate(D):
+                losses["D"] = DLoss(G, D, reals, augmentation=daugment)
+                if idx % 16 == 0 : losses["DR"] = DRLoss(D, reals, steps=16, weight=128)
+                accelerator.backward(losses["D"] + losses["DR"])
+
+                Dtx.step()
+                Dscheduler.step()
+                Dtx.zero_grad()
+
             with accelerator.accumulate(G):
-                output = GLoss(G, P, reals)
+                output = GLoss(G, D, P, reals)
                 losses["G"] = output["loss"]
                 accelerator.backward(losses["G"])
 
                 Gtx.step()
-                scheduler.step()
+                Gscheduler.step()
                 Gtx.zero_grad()
-                
-
+            
             accelerator.log({ **output, **losses })
 
             if idx % config["log_every_n_steps"] == 0:
