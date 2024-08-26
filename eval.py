@@ -40,7 +40,6 @@ def main(**config):
 
     tform = T.Compose([
         T.ToTensor(), T.Resize(config["size"], antialias=True),
-        T.RandomResizedCrop(config["size"], antialias=True),
         T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)),
         T.ConvertImageDtype(torch.float), T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
     ])
