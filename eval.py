@@ -1,12 +1,7 @@
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-from torchmetrics.image.fid import FrechetInceptionDistance
-from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
-from torchmetrics.image.psnr import PeakSignalNoiseRatio
-from torchmetrics.image.inception import InceptionScore
-from torchmetrics.regression.mae import MeanAbsoluteError
-from torchmetrics.regression.mse import MeanSquaredError
+from torchmetrics.image import FrechetInceptionDistance, StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio, InceptionScore
 
 
 import click
@@ -39,8 +34,8 @@ def main(**config):
     G.eval()
 
     tform = T.Compose([
-        T.ToTensor(), T.Resize(config["size"], antialias=True),
-        T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)),
+        T.ToTensor(), T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)), 
+        T.Resize((config["size"],config["size"]), antialias=True),
         T.ConvertImageDtype(torch.float), T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
     ])
 
@@ -56,10 +51,8 @@ def main(**config):
     PSNR = PeakSignalNoiseRatio()
     FID = FrechetInceptionDistance()
     IS = InceptionScore()
-    l1 = MeanAbsoluteError()
-    l2 = MeanSquaredError()
 
-    G, SSIM, PSNR, FID, IS, l1, l2, dataloader = accelerator.prepare(G, SSIM, PSNR, FID, IS, l1, l2, dataloader)
+    G, SSIM, PSNR, FID, IS, dataloader = accelerator.prepare(G, SSIM, PSNR, FID, IS, dataloader)
 
     flatten = lambda x : rearrange(x, "b c h w -> b (c h w)")
     for batch in tqdm(dataloader, total=len(dataloader)):
@@ -71,15 +64,11 @@ def main(**config):
             FID.update(images, real=True)
             PSNR.update(fakes, images)
             IS.update(fakes)
-            l1.update(flatten(fakes), flatten(images))
-            l2.update(flatten(fakes), flatten(images))
 
     accelerator.log({
         "FID": FID.compute(),
         "PSNR": PSNR.compute(),
         "IS": IS.compute(),
-        "l1": l1.compute(),
-        "l2": l2.compute(),
     })
 
     

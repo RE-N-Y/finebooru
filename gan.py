@@ -82,12 +82,13 @@ def GLoss(G, D, P, reals, augmentation=identity):
 @click.option("--padding", default=0, type=int)
 @click.option("--epochs", default=42, type=int)
 @click.option("--steps", default=1e+6, type=int)
+@click.option("--ttur", default=1., type=float)
 @click.option("--quantiser", default="vq", type=str)
 @click.option("--gradient_accumulation_steps", default=8, type=int)
 @click.option("--temperature", default=1, type=float)
 @click.option("--log_every_n_steps", default=1024, type=int)
 @click.option("--depth", default=12, type=int)
-@click.option("--dims", default=[8,8,8,6,5], type=list[int])
+@click.option("--dims", default=[8,8,8,5,5,5], type=list[int])
 @click.option("--beta1", default=0.9, type=float)
 @click.option("--beta2", default=0.99, type=float)
 @click.option("--wd", default=1e-4, type=float)
@@ -137,8 +138,7 @@ def main(**config):
     ds = deeplake.load(config["dataset"])
 
     tform = T.Compose([
-        T.ToTensor(), T.Resize(config["size"], antialias=True),
-        T.RandomResizedCrop(config["size"], scale=(0.8, 1), antialias=True),
+        T.ToTensor(), T.RandomResizedCrop((config["size"], config["size"]), scale=(0.8, 1), antialias=True),
         T.RandomHorizontalFlip(0.3), T.RandomAdjustSharpness(2,0.3), T.RandomAutocontrast(0.3),
         T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)),
         T.ConvertImageDtype(torch.float), T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
@@ -157,8 +157,9 @@ def main(**config):
     if config["compile"]:
         G, P, D = torch.compile(G), torch.compile(P), torch.compile(D)
 
-    Gtx = torch.optim.AdamW(G.parameters(), lr = config["lr"], betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
-    Dtx = torch.optim.AdamW(D.parameters(), lr = config["lr"], betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
+    Glr, Dlr = config["lr"], config["lr"] * config["ttur"]
+    Gtx = torch.optim.AdamW(G.parameters(), lr = Glr, betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
+    Dtx = torch.optim.AdamW(D.parameters(), lr = Dlr, betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
 
     Gscheduler = get_cosine_schedule_with_warmup(Gtx, 4096, config["epochs"] * len(dataloader))
     Dscheduler = get_cosine_schedule_with_warmup(Dtx, 4096, config["epochs"] * len(dataloader))

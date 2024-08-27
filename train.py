@@ -59,7 +59,7 @@ def GLoss(G, P, reals):
 @click.option("--temperature", default=1, type=float)
 @click.option("--log_every_n_steps", default=1024, type=int)
 @click.option("--depth", default=12, type=int)
-@click.option("--dims", default=[8,8,8,6,5], type=list[int])
+@click.option("--dims", default=[8,8,8,5,5,5], type=list[int])
 @click.option("--beta1", default=0.9, type=float)
 @click.option("--beta2", default=0.95, type=float)
 @click.option("--wd", default=1e-4, type=float)
@@ -108,10 +108,10 @@ def main(**config):
     ds = deeplake.load(config["dataset"])
 
     tform = T.Compose([
-        T.ToTensor(), T.Resize(config["size"], antialias=True),
-        T.RandomResizedCrop(config["size"], scale=(0.8, 1), antialias=True),
-        T.RandomHorizontalFlip(0.3), T.RandomAdjustSharpness(2,0.3), T.RandomAutocontrast(0.3),
+        T.ToTensor(), T.RandomResizedCrop((config["size"], config["size"])),
         T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)),
+        T.RandomHorizontalFlip(0.5), T.RandomAdjustSharpness(2,0.3), T.RandomAutocontrast(0.3),
+        T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
         T.ConvertImageDtype(torch.float), T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
     ])
 
