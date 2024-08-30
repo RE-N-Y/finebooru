@@ -463,3 +463,66 @@ class VQVAE(nn.Module):
         x = self.output(x)
 
         return x, loss, idxes
+
+
+class TikTok(nn.Module):
+    def __init__(self, features:int=768, backbone="attention", quantiser="vq", codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, strides:int=16, padding:int=0, bias=False, temperature=0.1, dims:int=[8,5,5,5]):
+        super().__init__()
+        self.features = features
+        self.size = size
+        self.patch = patch
+        self.strides = strides
+
+        self.ntoken = (size // strides)
+        self.tokens = 32
+        scale = 1 / math.sqrt(features)
+        self.latent = nn.Parameter(scale * torch.randn(self.tokens, features))
+        self.mask = nn.Parameter(scale * torch.randn(features))
+
+        self.epe = WPE(features, self.ntoken ** 2 + self.tokens)
+        self.dpe = WPE(features, self.ntoken ** 2 + self.tokens)
+
+        if backbone == "attention":
+            Block = Transformer
+        elif backbone == "ssd":
+            Block = SSD
+        elif backbone == "bssd":
+            Block = BSSD
+        else:
+            raise ValueError(f"Unsupported backbone {backbone}")
+
+        # patchify
+        self.input = nn.Conv2d(3, features, patch, stride=strides, padding=padding, bias=bias)
+        # encoder
+        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
+        self.encoder = nn.Sequential(*transformers)
+        # quantiser
+        if quantiser == "vq":
+            self.quantiser = VectorQuantiser(features, codes, pages)
+        elif quantiser == "fsq":
+            self.quantiser = FSQuantiser(features, codes, pages, levels=dims)
+        else:
+            raise ValueError(f"Unknown quantiser {quantiser}")
+
+        # decoder
+        transformers = [Block(features, heads=heads, bias=bias) for _ in range(depth)]
+        self.decoder = nn.Sequential(*transformers)
+
+    def forward(self, x, passthrough=False):
+        b, c, h, w = x.shape
+        x = rearrange(self.input(x), 'b c h w -> b (h w) c')
+        latents = repeat(self.latent, 't d -> b t d', b=b)
+        x = torch.cat((x, latents), dim=1)
+        x = self.encoder(self.epe(x))
+        
+        # only quantise the latents
+        codes, loss, idxes = self.quantiser(x[:, -self.tokens:, :])
+        x = x[:, :-self.tokens, :] if passthrough else codes
+        masks = repeat(self.mask, 'd -> b t d', b=b, t=self.ntoken ** 2)
+        x = torch.cat((masks, x), dim=1)
+        x = self.decoder(self.dpe(x))
+
+        # only output the non-latent part
+        x = rearrange(x[:, :-self.tokens, :], 'b (h w) c -> b c h w', h=self.ntoken, w=self.ntoken)
+
+        return x, loss, idxes
