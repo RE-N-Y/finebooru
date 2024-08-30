@@ -285,7 +285,7 @@ class CVQVAE(
 
         self.levels = levels
         self.mults = mults[:levels]
-        self.stacks = 2
+        self.stacks = 3
         self.input = nn.Conv2d(3, features, 3, padding=1, bias=bias)
 
         layers = []
