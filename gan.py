@@ -48,12 +48,12 @@ def DLoss(G, D, reals, augmentation=identity):
 
     return loss.mean()
 
-def GLoss(G, D, P, reals, augmentation=identity, usegan:bool=False):
+def GLoss(G, D, P, reals, augmentation=identity):
     fakes, compress, idxes = G(reals)
     l1 = torch.abs(fakes - reals).mean()
     l2 = torch.square(fakes - reals).mean()
     perceptual = P(reals, fakes).mean()
-    adversarial = F.softplus(-D(augmentation(fakes))).mean() if usegan else 0.
+    adversarial = F.softplus(-D(augmentation(fakes))).mean()
 
     loss = .1 * perceptual + \
            .1 * adversarial + \
@@ -176,7 +176,6 @@ def main(**config):
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             reals = batch["images"]
 
-            usegan = accelerator.step > -1
             with accelerator.accumulate(D):
                 Dtx.zero_grad()
 
@@ -186,13 +185,11 @@ def main(**config):
 
                 Dtx.step()
                 Dscheduler.step()
-                
-
 
             with accelerator.accumulate(G):
                 Gtx.zero_grad()
 
-                output = GLoss(G, D, P, reals, usegan=usegan)
+                output = GLoss(G, D, P, reals)
                 losses["G"] = output["loss"]
                 accelerator.backward(losses["G"])
 
