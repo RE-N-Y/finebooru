@@ -19,7 +19,7 @@ import click
 from functools import partial
 from tqdm import tqdm
 from pathlib import Path
-from einops import rearrange
+from einops import rearrange, reduce
 
 identity = lambda t : t
 vjp = partial(torch.autograd.grad, create_graph=True, retain_graph=True, only_inputs=True)
@@ -34,34 +34,37 @@ def DRLoss(D, reals:Tensor, steps=4, weight=1.):
     penalty = (norm - 1) ** 2
 
     loss = .5 * weight * steps * penalty
+
     return loss.mean()
 
 
 def DLoss(G, D, reals, augmentation=identity):
     fakes, loss, idxes = G(reals)
+    reals, fakes = reals.detach(), fakes.detach()
+    
     fscores = D(augmentation(fakes))
     rscores = D(augmentation(reals))
     loss = F.softplus(fscores) + F.softplus(-rscores)
 
     return loss.mean()
 
-def GLoss(G, D, P, reals, augmentation=identity):
+def GLoss(G, D, P, reals, augmentation=identity, usegan:bool=False):
     fakes, compress, idxes = G(reals)
-    l1 = torch.abs(fakes - reals)
-    l2 = torch.square(fakes - reals)
-    perceptual = P(reals, fakes)
-    adversarial = F.softplus(-D(augmentation(fakes)))
+    l1 = torch.abs(fakes - reals).mean()
+    l2 = torch.square(fakes - reals).mean()
+    perceptual = P(reals, fakes).mean()
+    adversarial = F.softplus(-D(augmentation(fakes))).mean() if usegan else 0.
 
-    loss = .1 * perceptual.mean() + \
-           .1 * adversarial.mean() + \
-            1 * l2.mean()
+    loss = .1 * perceptual + \
+           .1 * adversarial + \
+            1 * l2
 
     return { 
         "loss":loss, 
-        "perceptual":perceptual.mean(), 
-        "adversarial":adversarial.mean(), 
-        "l2":l2.mean(),
-        "l1":l1.mean(),
+        "perceptual":perceptual, 
+        "adversarial":adversarial, 
+        "l2":l2,
+        "l1":l1,
     }
 
 @click.command()
@@ -161,35 +164,41 @@ def main(**config):
     Gtx = torch.optim.AdamW(G.parameters(), lr = Glr, betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
     Dtx = torch.optim.AdamW(D.parameters(), lr = Dlr, betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
 
-    Gscheduler = get_cosine_schedule_with_warmup(Gtx, 4096, config["epochs"] * len(dataloader))
-    Dscheduler = get_cosine_schedule_with_warmup(Dtx, 4096, config["epochs"] * len(dataloader))
+    Gscheduler = get_cosine_schedule_with_warmup(Gtx, 0, config["epochs"] * len(dataloader))
+    Dscheduler = get_cosine_schedule_with_warmup(Dtx, 0, config["epochs"] * len(dataloader))
     size = sum(p.numel() for p in G.parameters() if p.requires_grad) / 1e+6
     accelerator.log({ "parameters" : size })
 
-    G, D, P, Gtx, Dtx, Gscheduler, Dscheduler, dataloader = accelerator.prepare(G, D, P, Gtx, Dtx, Gscheduler, Dscheduler, dataloader)
+    G, D, P, Gtx, Dtx, dataloader = accelerator.prepare(G, D, P, Gtx, Dtx, dataloader)
 
     for epoch in tqdm(range(config["epochs"])):
         losses = { "D" : 0, "G" : 0, "DR" : 0 }
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             reals = batch["images"]
 
+            usegan = accelerator.step > -1
             with accelerator.accumulate(D):
+                Dtx.zero_grad()
+
                 losses["D"] = DLoss(G, D, reals, augmentation=daugment)
-                if idx % 16 == 0 : losses["DR"] = DRLoss(D, reals, steps=16, weight=128)
+                if idx % 16 == 0 : losses["DR"] = DRLoss(D, reals, steps=16, weight=1.)
                 accelerator.backward(losses["D"] + losses["DR"])
 
                 Dtx.step()
                 Dscheduler.step()
-                Dtx.zero_grad()
+                
+
 
             with accelerator.accumulate(G):
-                output = GLoss(G, D, P, reals)
+                Gtx.zero_grad()
+
+                output = GLoss(G, D, P, reals, usegan=usegan)
                 losses["G"] = output["loss"]
                 accelerator.backward(losses["G"])
 
                 Gtx.step()
                 Gscheduler.step()
-                Gtx.zero_grad()
+                
             
             accelerator.log({ **output, **losses })
 
