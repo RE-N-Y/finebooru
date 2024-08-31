@@ -8,9 +8,6 @@ import numpy as onp
 from functools import partial
 from einops import rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange
-from mamba_ssm import Mamba2
-from causal_conv1d import causal_conv1d_fn
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from huggingface_hub import PyTorchModelHubMixin
 
 class Downsample(nn.Module):
@@ -232,50 +229,6 @@ class CSwiGLU(nn.Module):
     def forward(self, x):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
-
-class SSD(nn.Module):
-    def __init__(self, features:int, heads:int, bias=False, useconv=False, ntokens:int=32):
-        super().__init__()
-        self.mamba = Mamba2(features)
-        self.prenorm = RMSNorm(features)
-        self.postnorm = RMSNorm(features)
-        self.mlp = SwiGLU(features, useconv=useconv, ntokens=ntokens)
-
-    def forward(self, x):
-        x = self.mamba(self.prenorm(x)) + x
-        x = self.mlp(self.postnorm(x)) + x
-
-        return x
-
-# simple bidirectional mamba similar to Bidirectional LSTM
-class BSSD(nn.Module):
-    def __init__(self, features:int, heads:int, bias=False, useconv=False, ntokens:int=32):
-        super().__init__()
-
-        self.fwd = Mamba2(features)
-        self.bwd = Mamba2(features)
-
-        self.prenorm = RMSNorm(features)
-        self.fwdnorm = RMSNorm(features)
-        self.bwdnorm = RMSNorm(features)
-
-        self.fwdmlp = SwiGLU(features, useconv=useconv, ntokens=ntokens)
-        self.bwdmlp = SwiGLU(features, useconv=useconv, ntokens=ntokens)
-
-    def forward(self, x):
-        # b t d
-        f = x
-        b = torch.flip(x, dims=[1])
-
-        f = self.fwd(self.prenorm(f)) + f
-        f = self.fwdmlp(self.fwdnorm(f)) + f
-        b = self.bwd(self.prenorm(b)) + b
-        b = self.bwdmlp(self.bwdnorm(b)) + b
-
-        b = torch.flip(b, dims=[1])
-
-        return f + b
-
 class Attention(nn.Module):
     def __init__(self, features:int, heads:int, bias=False):
         super().__init__()
@@ -346,10 +299,6 @@ class CVQVAE(
         self.encoder = nn.Sequential(*layers)
         if quantiser == "vq":
             self.quantiser = VectorQuantiser(features * maxmult, codes, pages)
-        elif quantiser == "lfq":
-            self.quantiser = LFQuantiser(features * maxmult, codes, pages, temperature=temperature)
-        elif quantiser == "gumbel":
-            self.quantiser = GumbelQuantiser(features * maxmult, codes, pages)
         elif quantiser == "fsq":
             self.quantiser = FSQuantiser(features * maxmult, codes, pages, levels=dims)
         else:
@@ -419,10 +368,6 @@ class VQVAE(nn.Module):
 
         if backbone == "attention":
             Block = Transformer
-        elif backbone == "ssd":
-            Block = SSD
-        elif backbone == "bssd":
-            Block = BSSD
         else:
             raise ValueError(f"Unknown backbone {backbone}")
 
@@ -435,10 +380,6 @@ class VQVAE(nn.Module):
         # quantiser
         if quantiser == "vq":
             self.quantiser = VectorQuantiser(features, codes, pages)
-        elif quantiser == "lfq":
-            self.quantiser = LFQuantiser(features, codes, pages, temperature=temperature)
-        elif quantiser == "gumbel":
-            self.quantiser = GumbelQuantiser(features, codes, pages)
         elif quantiser == "fsq":
             self.quantiser = FSQuantiser(features, codes, pages, levels=dims)
         else:
@@ -484,10 +425,6 @@ class TikTok(nn.Module):
 
         if backbone == "attention":
             Block = Transformer
-        elif backbone == "ssd":
-            Block = SSD
-        elif backbone == "bssd":
-            Block = BSSD
         else:
             raise ValueError(f"Unsupported backbone {backbone}")
 
