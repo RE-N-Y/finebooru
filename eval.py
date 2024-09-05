@@ -60,8 +60,6 @@ def main(**config):
         num_workers=16, batch_size=config["batch_size"],
         decode_method={ "images":"numpy" }
     )
-
-
     PSNR = PeakSignalNoiseRatio()
     FID = FrechetInceptionDistance()
     IS = InceptionScore()
@@ -80,8 +78,6 @@ def main(**config):
             PSNR.update(fakes, images)
             IS.update(fakes)
             USAGE.update(idxes)
-
-
     iscore, _ = IS.compute()
     accelerator.log({
         "FID": FID.compute(),
