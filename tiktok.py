@@ -1,8 +1,7 @@
 import torch
 from torch import nn, Tensor, IntTensor
 import torch.nn.functional as F
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
+import torchvision.transforms as TF
 
 import lpips
 import wandb
@@ -22,11 +21,11 @@ from pathlib import Path
 def TLoss(T, reals:Tensor, proxies:IntTensor):
     fakes, compress, idxes = T(reals)
     lossfn = nn.CrossEntropyLoss()
-    
-    fakes, proxies = rearrange(fakes, 'b c h w -> b (c h w)'), rearrange(proxies, 'b t d -> b (t d)')
+
+    fakes = rearrange(fakes, 'b d h w -> b (h w) d')
     entropy = lossfn(fakes, proxies)
     loss = compress.mean() + entropy
-            
+
     return {
         "loss":loss,
         "compress":compress.mean(),
@@ -69,7 +68,7 @@ def main(**config):
     accelerator = Accelerator(gradient_accumulation_steps=config["gradient_accumulation_steps"], log_with="wandb")
     accelerator.init_trackers("vit", config, init_kwargs={"wandb":{"name":config["name"]}})
 
-    T = CVQVAE.from_pretrained(config["proxy"])
+    G = CVQVAE.from_pretrained(config["proxy"])
     T = TikTok(
         features=config["features"],
         backbone="attention",
@@ -85,12 +84,12 @@ def main(**config):
 
     ds = deeplake.load(config["dataset"])
 
-    tform = T.Compose([
-        T.ToTensor(), T.RandomResizedCrop((config["size"], config["size"])),
-        T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)),
-        T.RandomHorizontalFlip(0.5), T.RandomAdjustSharpness(2,0.3), T.RandomAutocontrast(0.3),
-        T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-        T.ConvertImageDtype(torch.float), T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+    tform = TF.Compose([
+        TF.ToTensor(), TF.RandomResizedCrop((config["size"], config["size"])),
+        TF.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)),
+        TF.RandomHorizontalFlip(0.5), TF.RandomAdjustSharpness(2,0.3), TF.RandomAutocontrast(0.3),
+        TF.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+        TF.ConvertImageDtype(torch.float), TF.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
     ])
 
     dataloader = ds.pytorch(
@@ -112,14 +111,13 @@ def main(**config):
     accelerator.log({ "parameters" : size })
 
     T, G, Ttx, scheduler, dataloader = accelerator.prepare(T, G, Ttx, scheduler, dataloader)
-    T:CVQVAE
 
     for epoch in tqdm(range(config["epochs"])):
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             losses = { "T" : 0 }
             reals = batch["images"]
             with torch.no_grad():
-                proxies = T.tokenise(reals)
+                _, loss, proxies = T(reals)
 
             with accelerator.accumulate(T):
                 Ttx.zero_grad()
@@ -130,15 +128,10 @@ def main(**config):
 
                 Ttx.step()
                 scheduler.step()
-                
+
             accelerator.log({ **losses })
-            
-            if idx > config["steps"]:
-                accelerator.end_training()
-                return
-            
     accelerator.end_training()
-    
+
     G_ = accelerator.unwrap_model(T)
     if config["save"]:
         G_.save_pretrained(f"RE-N-Y/{config['name']}")

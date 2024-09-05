@@ -147,7 +147,7 @@ class FSQuantiser(nn.Module):
         half = self.levels // 2
         codes = codes * half + half
         idxes = torch.sum(codes * self.basis, dim=-1)
-        return idxes.to(torch.uint32)
+        return idxes.to(torch.int64)
     
     def codes(self, idxes:Tensor) -> Tensor:
         half = self.levels // 2
@@ -280,12 +280,12 @@ class CVQVAE(
         super().__init__()
         self.size = size
 
-        mults = [1, 1, 2, 2, 4, 4]
+        mults = [1, 2, 4, 8, 8, 8]
         maxmult = mults[levels - 1]
 
         self.levels = levels
         self.mults = mults[:levels]
-        self.stacks = 2
+        self.stacks = 3
         self.input = nn.Conv2d(3, features, 3, padding=1, bias=bias)
 
         layers = []

@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
+from torchmetrics import Metric
 from torchmetrics.image import FrechetInceptionDistance, StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio, InceptionScore
 
 
@@ -18,6 +19,20 @@ def toimage(image):
     image = image.to(torch.uint8)
     return image
 
+class CodebookUsage(Metric):
+    def __init__(self, pages:int, **kwargs):
+        super().__init__(**kwargs)
+        self.pages = pages
+        self.add_state("usage", default=torch.zeros(pages, dtype=torch.int), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.zeros(1, dtype=torch.int), dist_reduce_fx="sum")
+
+    def update(self, idxes):
+        self.usage += torch.bincount(idxes.view(-1), minlength=self.pages)
+        self.total += len(idxes)
+
+    def compute(self):
+        return torch.sum(self.usage > 0) / self.pages
+
 @click.command()
 @click.option("--name", default="name", type=str)
 @click.option("--dataset", default="hub://activeloop/imagenet-val", type=str)
@@ -34,7 +49,7 @@ def main(**config):
     G.eval()
 
     tform = T.Compose([
-        T.ToTensor(), T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)), 
+        T.ToTensor(), T.Lambda(lambda x: x.repeat(int( 3 / len(x)), 1, 1)),
         T.Resize((config["size"],config["size"]), antialias=True),
         T.ConvertImageDtype(torch.float), T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
     ])
@@ -46,34 +61,35 @@ def main(**config):
         decode_method={ "images":"numpy" }
     )
 
-    
-    SSIM = StructuralSimilarityIndexMeasure()
+
     PSNR = PeakSignalNoiseRatio()
     FID = FrechetInceptionDistance()
     IS = InceptionScore()
+    USAGE = CodebookUsage(pages=G.quantiser.pages)
 
-    G, SSIM, PSNR, FID, IS, dataloader = accelerator.prepare(G, SSIM, PSNR, FID, IS, dataloader)
+    G, PSNR, FID, IS, USAGE, dataloader = accelerator.prepare(G, PSNR, FID, IS, USAGE, dataloader)
 
-    flatten = lambda x : rearrange(x, "b c h w -> b (c h w)")
     for batch in tqdm(dataloader, total=len(dataloader)):
         images = batch["images"]
         with torch.inference_mode():
             fakes, compress, idxes= G(images)
             images, fakes = toimage(images), toimage(fakes)
+
             FID.update(fakes, real=False)
             FID.update(images, real=True)
             PSNR.update(fakes, images)
             IS.update(fakes)
+            USAGE.update(idxes)
 
+
+    iscore, _ = IS.compute()
     accelerator.log({
         "FID": FID.compute(),
         "PSNR": PSNR.compute(),
-        "IS": IS.compute(),
+        "IS": iscore,
+        "usage": USAGE.compute()
     })
 
-    
+
 if __name__ == "__main__":
     main()
-
-
-
