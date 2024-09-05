@@ -17,7 +17,7 @@ accelerate launch --config_file 4.yml --main_process_port 29542 train.py \
     --dataset hub://activeloop/imagenet-train \
     --backbone convolution \
     --lr 3e-4 \
-    --epochs 32 \
+    --epochs 16 \
     --features 192 \
     --batch_size 16 \
     --heads 6 \
